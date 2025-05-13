@@ -1697,11 +1697,11 @@ if __name__ =='__main__':
     nums_of_head = 3 # 可能不用於 TriAttn
     top_n = 8 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    epochs = 100 
+    epochs = 300 
     LR = 1e-5 
     intermediate = True # 測試包含中間損失
     contrastive_learning = True # 測試包含對比損失
-    batch_size = 1 
+    batch_size = 16 
     save_model_dir = "./saved_models_mediq"
     if not os.path.exists(save_model_dir):
         os.makedirs(save_model_dir)
