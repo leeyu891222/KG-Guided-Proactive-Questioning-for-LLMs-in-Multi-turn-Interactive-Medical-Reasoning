@@ -1121,7 +1121,11 @@ class Trainer(nn.Module):
                  path_ranker_type="Flat", # Or "Combo" (For TriAttn versions)
                  gnn_type="Stack", # Or "Single"
                  prune_thsh=0.8, # Threshold used in original prune_paths util
-                 triplet_margin=1.0): # Margin for triplet loss
+                 triplet_margin=1.0, # Margin for triplet loss
+                 early_stopping_patience=3,    # 默認容忍3個epoch
+                 early_stopping_metric='val_loss', # 監控驗證損失
+                 early_stopping_delta=0.001    # 至少要有這麼多改善才算
+                 ): 
         super(Trainer, self).__init__()
 
         self.tokenizer = tokenizer
@@ -1169,6 +1173,17 @@ class Trainer(nn.Module):
         self.save_model_path = save_model_path
         # self.save_cui_embedding_path = save_cui_embedding_path # Handle CUI embedding saving outside if needed
 
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_metric = early_stopping_metric.lower() # val_loss or val_acc
+        self.early_stopping_delta = early_stopping_delta
+        self.epochs_no_improve = 0
+        self.early_stop = False
+        if self.early_stopping_metric == 'val_loss':
+            self.best_metric_val = float('inf') # For loss, lower is better
+        elif self.early_stopping_metric == 'val_acc':
+            self.best_metric_val = float('-inf') # For accuracy, higher is better
+        else:
+            raise ValueError("early_stopping_metric 必須是 'val_loss' 或 'val_acc'")
         
 
         print("**** ============= **** ")
@@ -1493,11 +1508,11 @@ class Trainer(nn.Module):
 
 
     def train(self, train_data, dev_data, lr_scheduler=None):
-        """Main training loop."""
+        """Main training loop with early stopping."""
         if self.optimizer is None:
             self.create_optimizers()
 
-        min_dev_loss = float('inf')
+        # min_dev_loss = float('inf') # 由 self.best_metric_val 取代
         update_step = 4 # Gradient accumulation steps
 
         for ep in range(self.nums_of_epochs):
@@ -1506,94 +1521,105 @@ class Trainer(nn.Module):
             self.encoder.train()
             self.gmodel.train()
             epoch_loss_train = []
-            epoch_acc_train = [] # Accuracy on training batch (using hop2 targets)
+            epoch_acc_train = []
             batch_count = 0
             accumulated_loss = 0.0
-
-            # Use tqdm for progress bar
             train_pbar = tqdm(train_data, desc=f"Epoch {ep+1} Training")
 
             for batch in train_pbar:
-                if batch is None: continue # Skip None batches from collate_fn
-
-                # Perform forward pass
+                if batch is None: continue
                 batch_loss, final_predictions = self.forward_per_batch(batch)
-
-                # Calculate accuracy for monitoring
-                # Ensure target_cuis_batch uses the hop2 targets for final accuracy calculation
                 target_cuis_batch = batch['hop2_target_cuis']
                 batch_acc = self.measure_accuracy(final_predictions, target_cuis_batch, mode="Recall@N")
 
-                # Normalize loss for accumulation
                 batch_loss_normalized = batch_loss / update_step
-                accumulated_loss += batch_loss_normalized.item() # Use .item() for accumulation
+                # accumulated_loss += batch_loss_normalized.item() # 應該在 step 後記錄
+                
+                if torch.isnan(batch_loss_normalized) or torch.isinf(batch_loss_normalized):
+                    print(f"警告: Epoch {ep+1}, Batch {batch_count+1}, 檢測到 NaN 或 Inf 損失，跳過反向傳播。損失值: {batch_loss_normalized.item()}")
+                    # 選擇是否需要清零梯度，以防之前的梯度影響下一次有效的 step
+                    if (batch_count + 1) % update_step == 0: # 如果剛好在 step 的邊界
+                        self.optimizer.zero_grad() # 清零，因為這次 step 不會執行
+                    accumulated_loss = 0.0 # 重置，因為這次 step 不會執行
+                    batch_count += 1
+                    continue # 跳過當前的 backward 和 step
 
-                # Backpropagate
                 batch_loss_normalized.backward()
+                accumulated_loss += batch_loss_normalized.item() # 在 backward 後記錄
                 batch_count += 1
 
-                # Optimizer step after accumulation
                 if batch_count % update_step == 0:
-                    # Optional: Gradient clipping
                     torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0)
                     torch.nn.utils.clip_grad_norm_(self.gmodel.parameters(), 1.0)
-
                     self.optimizer.step()
                     self.optimizer.zero_grad()
 
-                    # Log accumulated loss
-                    avg_accum_loss = accumulated_loss
+                    avg_accum_loss = accumulated_loss # 因為 accumulated_loss 是 update_step 個 normalized_loss 的和
                     epoch_loss_train.append(avg_accum_loss)
-                    epoch_acc_train.append(batch_acc) # Store accuracy calculated before zeroing loss
+                    epoch_acc_train.append(batch_acc)
+                    train_pbar.set_postfix({'Loss': f'{avg_accum_loss:.4f}', 'Acc': f'{batch_acc:.4f}'})
+                    accumulated_loss = 0.0
 
-                    # Update progress bar
-                    train_pbar.set_postfix({
-                        'Loss': f'{avg_accum_loss:.4f}',
-                        'Acc': f'{batch_acc:.4f}'
-                        })
-                    accumulated_loss = 0.0 # Reset accumulated loss
-
-                # Optional: Print step loss more frequently
-                # if batch_count % self.print_step == 0:
-                #     step_loss = np.mean(epoch_loss_train[-self.print_step//update_step:]) if epoch_loss_train else 0.0
-                #     step_acc = np.mean(epoch_acc_train[-self.print_step//update_step:]) if epoch_acc_train else 0.0
-                #     print(f"  Step {batch_count}: Avg Train Loss (last {self.print_step}): {step_loss:.4f}, Avg Train Acc: {step_acc:.4f}")
-
-
-            # End of Epoch - Calculate average training loss and accuracy
-            avg_epoch_train_loss = np.mean(epoch_loss_train) if epoch_loss_train else 0.0
-            avg_epoch_train_acc = np.mean(epoch_acc_train) if epoch_acc_train else 0.0
+            avg_epoch_train_loss = np.mean(epoch_loss_train) if epoch_loss_train else float('nan')
+            avg_epoch_train_acc = np.mean(epoch_acc_train) if epoch_acc_train else float('nan')
             print(f"\nEpoch {ep+1} Average Training Loss: {avg_epoch_train_loss:.4f}, Average Training Acc: {avg_epoch_train_acc:.4f}")
 
             # Validation Step
             avg_epoch_dev_loss, avg_epoch_dev_acc = self.validate(dev_data)
             print(f"Epoch {ep+1} Validation Loss: {avg_epoch_dev_loss:.4f}, Validation Acc: {avg_epoch_dev_acc:.4f}")
 
-            # Learning Rate Scheduler Step
             if lr_scheduler:
                 lr_scheduler.step()
                 print(f"LR Scheduler stepped. Current LR: {self.optimizer.param_groups[0]['lr']:.6f}")
 
+            # --- Early Stopping Logic ---
+            current_metric_val = None
+            if self.early_stopping_metric == 'val_loss':
+                current_metric_val = avg_epoch_dev_loss
+                # 檢查是否有改善 (損失越低越好)
+                if current_metric_val < self.best_metric_val - self.early_stopping_delta:
+                    print(f"Validation loss improved ({self.best_metric_val:.4f} --> {current_metric_val:.4f}). Saving model...")
+                    self.best_metric_val = current_metric_val
+                    self.epochs_no_improve = 0
+                    if self.save_model_path:
+                        try:
+                            torch.save(self.gmodel.state_dict(), self.save_model_path)
+                            encoder_save_path = os.path.join(os.path.dirname(self.save_model_path), "encoder.pth")
+                            torch.save(self.encoder.state_dict(), encoder_save_path)
+                            print(f"Model saved to {self.save_model_path} and {encoder_save_path}")
+                        except Exception as e:
+                            print(f"Error saving model: {e}")
+                else:
+                    self.epochs_no_improve += 1
+                    print(f"Validation loss did not improve for {self.epochs_no_improve} epoch(s). Best: {self.best_metric_val:.4f}")
 
-            # Save Best Model based on validation loss
-            if avg_epoch_dev_loss < min_dev_loss:
-                print(f"Validation loss improved ({min_dev_loss:.4f} --> {avg_epoch_dev_loss:.4f}). Saving model...")
-                min_dev_loss = avg_epoch_dev_loss
-                if self.save_model_path:
-                    try:
-                        # Save the GraphModel and the base Encoder separately
-                        torch.save(self.gmodel.state_dict(), self.save_model_path)
-                        encoder_save_path = os.path.join(os.path.dirname(self.save_model_path), "encoder.pth")
-                        torch.save(self.encoder.state_dict(), encoder_save_path)
-                        print(f"Model saved to {self.save_model_path} and {encoder_save_path}")
-                        # Saving CUI embeddings might be large, do externally if needed
-                        # cui_emb_save_path = os.path.join(os.path.dirname(self.save_model_path), "node_embedding.pkl")
-                        # with open(cui_emb_save_path,'wb') as outf:
-                        #     pickle.dump(self.gmodel.n_encoder.data, outf)
-                        # print(f"CUI embeddings saved to {cui_emb_save_path}")
-                    except Exception as e:
-                        print(f"Error saving model: {e}")
+            elif self.early_stopping_metric == 'val_acc':
+                current_metric_val = avg_epoch_dev_acc
+                # 檢查是否有改善 (準確率越高越好)
+                if current_metric_val > self.best_metric_val + self.early_stopping_delta:
+                    print(f"Validation accuracy improved ({self.best_metric_val:.4f} --> {current_metric_val:.4f}). Saving model...")
+                    self.best_metric_val = current_metric_val
+                    self.epochs_no_improve = 0
+                    if self.save_model_path:
+                        try:
+                            torch.save(self.gmodel.state_dict(), self.save_model_path)
+                            encoder_save_path = os.path.join(os.path.dirname(self.save_model_path), "encoder.pth")
+                            torch.save(self.encoder.state_dict(), encoder_save_path)
+                            print(f"Model saved to {self.save_model_path} and {encoder_save_path}")
+                        except Exception as e:
+                            print(f"Error saving model: {e}")
+                else:
+                    self.epochs_no_improve += 1
+                    print(f"Validation accuracy did not improve for {self.epochs_no_improve} epoch(s). Best: {self.best_metric_val:.4f}")
+
+            if self.epochs_no_improve >= self.early_stopping_patience:
+                self.early_stop = True
+                print(f"\nEarly stopping triggered after {ep+1} epochs due to no improvement for {self.early_stopping_patience} consecutive epochs.")
+                break # 跳出訓練循環
             print("-" * 50)
+
+        if not self.early_stop:
+            print("Training finished after all epochs.")
 
 
     def validate(self, dev_data):
@@ -1669,76 +1695,82 @@ if __name__ =='__main__':
     # 其他超參數
     hdim = 768
     nums_of_head = 3 # 可能不用於 TriAttn
-    top_n = 8 # 示例值
+    top_n = 8 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    epochs = 10 # 測試時設為 1 或更少
-    LR = 1e-5 # 示例值
+    epochs = 100 
+    LR = 1e-5 
     intermediate = True # 測試包含中間損失
     contrastive_learning = True # 測試包含對比損失
-    batch_size = 1 # 使用小 batch size 測試
+    batch_size = 1 
+    save_model_dir = "./saved_models_mediq"
+    if not os.path.exists(save_model_dir):
+        os.makedirs(save_model_dir)
+    save_model_path = os.path.join(save_model_dir, "gmodel_mediq_best.pth")
 
 
 
-    # --- Trainer 實例化與測試 ---
-    print("\n" + "="*30)
-    print(" STARTING TRAINING ")
-    print("="*30 + "\n")
+    
+    print("Instantiating Trainer...")
+    trainer = Trainer(
+        tokenizer=tokenizer,
+        encoder=encoder,
+        g=g,
+        cui_embedding=cui_embedding,
+        hdim=hdim,
+        nums_of_head=nums_of_head,
+        cui_vocab=cui_vocab,
+        # nums_of_hops=2, # 已在內部設為 2
+        top_n=top_n,
+        device=device,
+        nums_of_epochs=epochs, 
+        LR=LR,
+        cui_weights=cui_weights,
+        contrastive_learning=contrastive_learning,
+        intermediate=intermediate,
+        save_model_path=save_model_path, 
+        early_stopping_patience=5, # 例如，如果連續5個epoch沒有改善則停止
+        early_stopping_metric='val_loss', # 可以是 'val_loss' 或 'val_acc'
+        early_stopping_delta=0.001 # 只有當改善大於此值才算
+        # 其他可選參數...
+    )
+    # trainer.to(device) # Trainer __init__ 內部應已處理
+    print("Trainer instantiated successfully.")
 
+    print("\nCreating optimizer...")
+    trainer.create_optimizers()
+    lr_scheduler= torch.optim.lr_scheduler.StepLR(trainer.optimizer, step_size=3, gamma=0.6)
+    # --- 加載測試數據 ---
+    print("\nLoading data batch...")
     try:
-        print("Instantiating Trainer...")
-        trainer = Trainer(
-            tokenizer=tokenizer,
-            encoder=encoder,
-            g=g,
-            cui_embedding=cui_embedding,
-            hdim=hdim,
-            nums_of_head=nums_of_head,
-            cui_vocab=cui_vocab,
-            # nums_of_hops=2, # 已在內部設為 2
-            top_n=top_n,
-            device=device,
-            nums_of_epochs=epochs, # 僅用於初始化，實際訓練循環不執行
-            LR=LR,
-            cui_weights=cui_weights,
-            contrastive_learning=contrastive_learning,
-            intermediate=intermediate,
-            # 傳遞其他 __init__ 需要的參數...
-            save_model_path="./test_model_save/gmodel.pth", # 提供一個測試路徑
-            # 其他可選參數...
-        )
-        # trainer.to(device) # Trainer __init__ 內部應已處理
-        print("Trainer instantiated successfully.")
-
-        print("\nCreating optimizer...")
-        trainer.create_optimizers()
-        if trainer.optimizer:
-             print("Optimizer created successfully.")
-        else:
-             print("Error: Optimizer not created.")
-             exit()
-        lr_scheduler= torch.optim.lr_scheduler.StepLR(trainer.optimizer, step_size=3, gamma=0.6)
-        # --- 加載測試數據 ---
-        print("\nLoading test data batch...")
-        # 確保使用與 Trainer 匹配的數據集和 collate_fn
         train_dataset = MediQAnnotatedDataset(TRAIN_ANNOTATION_FILE, tokenizer)
         dev_dataset = MediQAnnotatedDataset(DEV_ANNOTATION_FILE, tokenizer)
-        if len(train_dataset) == 0:
-            print("Error: Test dataset is empty!")
-            exit()
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths)
-        dev_loader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths)
-    
-        trainer.train(train_loader,dev_loader, lr_scheduler)
-
-
-
     except Exception as e:
-        print(f"Error during Trainer initialization or setup: {e}")
+        print(f"加載數據集時出錯: {e}")
+        exit()   
+    if len(train_dataset) == 0 or len(dev_dataset) == 0:
+        print("Error: dataset is empty!")
+        exit()
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths)
+    dev_loader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths)
+
+    
+    print("\n" + "="*30)
+    print(" STARTING FORMAL TRAINING RUN ")
+    print("="*30 + "\n")
+    
+    try:
+        trainer.train(train_loader, dev_loader, lr_scheduler)
+    except Exception as e:
+        print(f"Error during Training: {e}")
         import traceback
-        traceback.print_exc() # 打印詳細錯誤堆棧
-
-
+        traceback.print_exc()
+    
     print("\n" + "="*30)
     print(" TRAINING FINISHED ")
     print("="*30 + "\n")
+
+
+
+
+    
 
