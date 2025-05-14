@@ -236,58 +236,66 @@ def retrieve_phrases(paths, cui_aui_mappings):
 
 
 
-def retrieve_neighbors_paths_no_self(cui_lists, g, prev_candidate_paths_df):
-    #import queue 
-    """Important function to reformat paths and direct neighbors 
-    Input: 
-    cui_lists: a list of CUIs that start searching
-    g: current graph 
-    candidate_paths_df: if not None, it is the history one-hot path from previous traversal iteration
-    Output:
-    all_paths: a list of one-hot hop given cui_lists 
-    all_neighbors: a list of concepts that will be the candidate predictions
-    path_memories: a list of list with four elements: visited source nodes from the prev iteration; 
-                                                      starting nodes at the current iteration (aka cui_list);
-                                                      current candidate node, 
-                                                      current candidate edge 
+def retrieve_neighbors_paths_no_self(cui_lists, g, prev_candidate_paths_df, adj_cache): # <--- 增加 adj_cache 參數
+    """Important function to reformat paths and direct neighbors
+    MODIFIED to use adj_cache.
     """
-    cui_neighbors = retrieve_subgraphs(cui_lists, g) # dictionary of cuis and their neighrbos 
-    all_neighbors = [] 
-    all_paths = [] 
-    path_memories = [] # dict or list? 
-    path_buffer = {} # path buffer, a list of dictionary indicating what sources lead to the current target
-    if prev_candidate_paths_df is None: 
-        all_neighbors = [vv[0] for k,v in cui_neighbors.items() for vv in v if len(v) !=0] # list of neighbor nodes 
-        all_paths = [[k, vv[0], vv[1]] for k,v in cui_neighbors.items() for vv in v if len(v) !=0] # list of one-hop path
+    
+    cui_neighbors = retrieve_subgraphs_from_cache(cui_lists, adj_cache)
+    
+
+    all_neighbors = []
+    all_paths = []
+    path_memories = []
+    path_buffer = {}
+
+    if prev_candidate_paths_df is None:
+        all_neighbors = [vv[0] for k,v in cui_neighbors.items() for vv in v if len(v) !=0]
+        all_paths = [[k, vv[0], vv[1]] for k,v in cui_neighbors.items() for vv in v if len(v) !=0]
         path_memories = [[[k], k, vv[0], vv[1]] for k,v in cui_neighbors.items() for vv in v if len(v) !=0]
     else:
-        # faster version using itertuples 
         for _ in  prev_candidate_paths_df.itertuples():
             src, tgt = _.Src, _.Tgt
             if src == tgt:
-                continue 
+                continue
             if tgt in path_buffer:
                 path_buffer[tgt].append(src)
             else:
                 path_buffer[tgt]= [src]
-        # remove a specific path where it is the self edge at the first hop 
-        for k,v in cui_neighbors.items():
-            #print("path buffer k {path_buffer[k]} given k", )
-            if len(v) == 0:
+
+        for k,v_list in cui_neighbors.items(): # k is a CUI from cui_lists, v_list is its neighbors from cache
+            if not v_list: # len(v_list) == 0
                 continue
             if k not in path_buffer:
-                record = [k,k,k,"self"]
-                if record not in path_memories:
-                    path_memories.append(record)
-                continue 
-            for vv in v:
-                path_memories.append([path_buffer[k], k, vv[0], vv[1]]) 
+                # If k was a starting node not reachable from previous paths,
+                # it can still initiate new paths (e.g., self-loop or new explorations).
+                # Original code added a 'self' path memory. Let's see if we want to keep that.
+                # For now, let's assume if k is not in path_buffer, it means it's a fresh start for paths from k.
+                # The original 'self' path was more about ensuring a node remains in consideration.
+                # Our path_memories for first hop (prev_candidate_paths_df is None) handle initial paths.
+                # This logic here might need careful review based on how path_buffer and k are used.
+                # The original code's `record = [k,k,k,"self"]` implied path_buffer[k] should be [k].
+                # Let's simplify: if k is not in path_buffer, it means it's an original source for this hop,
+                # and its "previous path" part in path_memories would be just [k].
+                # path_buffer[k] would contain the "previous hop's source(s)" that led to k.
+                # If k is in cui_lists (current hop sources) but not in path_buffer,
+                # it implies k itself is an initial source not derived from a previous hop's target.
+                current_path_prefix = [k] # Default prefix if not found in path_buffer
+            else:
+                current_path_prefix = path_buffer[k]
 
-        all_paths =[pm[1:] for pm in path_memories] 
-        all_neighbors =[pm[-2] for pm in path_memories]
-    #print("ALL NEIGHRBORS", all_neighbors)
-    #print("PATH MEMO: ", path_memories)
-    return all_paths, all_neighbors, path_memories  
+
+            for vv in v_list: # vv is [neighbor_cui, edge_label]
+                path_memories.append([current_path_prefix, k, vv[0], vv[1]])
+
+        if path_memories: # Ensure path_memories is not empty before list comprehensions
+            all_paths =[pm[1:] for pm in path_memories]
+            all_neighbors =[pm[-2] for pm in path_memories]
+        else: # Handle case where no paths/neighbors are generated in this branch
+            all_paths = []
+            all_neighbors = []
+
+    return all_paths, all_neighbors, path_memories 
 
 
 
@@ -347,6 +355,30 @@ def prune_paths(input_text_vec, cand_neighbors_vs, cand_neighbors_list, threshol
     new_cand_neighbors_lists = [cand_neighbors_list[_] for _ in I_sorted[0]]
 
     return new_cand_neighbors_lists, new_cand_neighbor_vs
+
+def retrieve_subgraphs_from_cache(cuis: list, adj_cache: dict):
+    """
+    Retrieves subgraph information (direct neighbors and edge labels) for a list of CUIs
+    from a pre-computed adjacency cache.
+
+    Args:
+        cuis (list): A list of CUI strings to retrieve subgraphs for.
+        adj_cache (dict): A pre-computed dictionary where keys are node CUIs and
+                          values are lists of tuples (neighbor_cui, edge_label).
+                          Example: {'CUI1': [('Neighbor1', 'RelA'), ('Neighbor2', 'RelB')]}
+
+    Returns:
+        dict: A dictionary where keys are the input CUIs and values are lists of
+              [neighbor_cui, edge_label] pairs.
+              Example: {'CUI1': [['Neighbor1', 'RelA'], ['Neighbor2', 'RelB']]}
+    """
+    subgraphs = {}
+    for c in cuis:
+        # Get neighbor info from cache, default to empty list if CUI not in cache (should not happen if cache is complete for g.nodes)
+        neighbors_info_for_c = adj_cache.get(c, [])
+        # Ensure the format matches original retrieve_subgraphs output: list of [neighbor, label]
+        subgraphs[c] = [[neighbor, label] for neighbor, label in neighbors_info_for_c]
+    return subgraphs
 # ====================== gnn  ===================
 
 class CuiEmbedding(object):
@@ -757,27 +789,51 @@ class GraphModel(nn.Module):
         self.n_encoder = cui_embedding # CuiEmbedding object
         self.e_encoder = EdgeOneHot(graph=g) # EdgeOneHot object
         self.edges_mappings = self.e_encoder.edge_mappings
+        self.g = g # networkx graph object
+        # --- 創建 adj_cache ---
+        self.adj_cache = {}
+        print("預計算圖譜鄰接信息 (adj_cache)...")
+        # Consider using self.g.nodes() if it's comprehensive or a specific list if relevant CUIs are known
+        nodes_to_cache = list(self.g.nodes()) # Cache for all nodes in the graph 'g'
+        for node in tqdm(nodes_to_cache, desc="Caching Adjacency"):
+            neighbors_info = []
+            if self.g.has_node(node): # Should always be true if iterating g.nodes()
+                # Use successors for directed graph to get outgoing edges
+                for neighbor in self.g.successors(node):
+                    if self.g.has_edge(node, neighbor):
+                        # Assuming only one edge between node and neighbor, or take the first one
+                        edge_data_dict = self.g.get_edge_data(node, neighbor)
+                        # If multiple edges, NetworkX might return a dict of dicts if multigraph
+                        # For DiGraph, it's usually one dict of attributes for the single edge
+                        if isinstance(edge_data_dict, dict): # Standard case
+                            label = edge_data_dict.get('label', 'UNKNOWN_REL')
+                            neighbors_info.append((neighbor, label))
+                        # Handle MultiDiGraph if 'label' is nested under edge keys (e.g., 0, 1 for parallel edges)
+                        # else: # This block might be needed if g is a MultiDiGraph and you want all parallel edges
+                        #     for edge_key, edge_attrs in edge_data_dict.items():
+                        #         label = edge_attrs.get('label', 'UNKNOWN_REL')
+                        #         neighbors_info.append((neighbor, label))
+            self.adj_cache[node] = neighbors_info
+        print(f"鄰接信息預計算完成。緩存了 {len(self.adj_cache)} 個節點的信息。")
+        # --- adj_cache 創建結束 ---
+        
+        
         self.p_encoder_type = path_encoder_type
         self.path_ranker_type = path_ranker_type
-
-        # Instantiate Path Encoder based on type
-        # Note: Original encoders expect specific inputs (src_emb, tgt+edge_emb).
-        # If encoding pre-calculated paths differently, this might need adjustment later.
+        edge_dim = self.e_encoder.num_edge_types
+        
         if self.p_encoder_type == "Transformer":
-            # Transformer version expects edge dim + node dim = path_dim
-            edge_dim = self.e_encoder.onehot_mat.shape[-1] if self.e_encoder else 0
             self.p_encoder = PathEncoderTransformer(hdim, hdim + edge_dim)
-        else: # Default to MLP version
-            edge_dim = self.e_encoder.onehot_mat.shape[-1] if self.e_encoder else 0
+        else:
             self.p_encoder = PathEncoder(hdim, hdim + edge_dim)
 
-        # Instantiate Path Ranker based on type
         if self.path_ranker_type == "Combo":
             self.p_ranker = TriAttnCombPathRanker(hdim)
-        else: # Default to Flat version
+        else:
             self.p_ranker = TriAttnFlatPathRanker(hdim)
 
-        self.g = g # networkx graph object
+
+        
         self.k = nums_of_hops # max k hops (should be 2)
         self.path_per_batch_size = 128 # Batch size for processing paths internally
         self.top_n = top_n
@@ -823,32 +879,26 @@ class GraphModel(nn.Module):
 
         # 1. Dynamic neighbor finding using the utility function
         candidate_paths, candidate_neighbors, path_memories = retrieve_neighbors_paths_no_self(
-            cui_lists, self.g, prev_candidate_paths_df # 使用上一輪的 df
+            cui_lists, self.g, prev_candidate_paths_df, self.adj_cache # Pass the cache
         )
-        '''
-        # +++ Debugging: Check raw candidate_paths +++
-        print(f"\n--- Debug Info (Inside one_iteration, k={running_k}, Start) ---")
-        print(f"Input cui_lists (first 10): {cui_lists[:10]}")
-        print(f"Number of candidate_paths from retrieve_neighbors: {len(candidate_paths)}")
-        malformed_paths_found = False
-        for i, p in enumerate(candidate_paths):
-             # More robust check: is it a list of 3 strings?
-             if not (isinstance(p, list) and len(p) == 3 and all(isinstance(item, str) for item in p)):
-                print(f"  !!! Malformed path found at index {i}: Type={type(p)}, Value={p}")
-                malformed_paths_found = True
-        if not malformed_paths_found:
-             print("  All candidate_paths seem correctly formatted (list of 3 strings).")
-        else:
-             print("  !!! Found malformed paths in candidate_paths list !!!")
-             # Decide how to handle: filter or return error? Let's filter for now
-             original_count = len(candidate_paths)
-             candidate_paths = [p for p in candidate_paths if isinstance(p, list) and len(p) == 3 and all(isinstance(item, str) for item in p)]
-             print(f"  Filtered malformed paths. Count reduced from {original_count} to {len(candidate_paths)}.")
-        # +++ End Check +++
-        '''
+        
+        # +++ Debugging and Robustness for DataFrame creation +++
         if not candidate_paths:
-            print(f"  No valid candidate paths found after filtering or initially.")
+            # print(f"  k={running_k}: No candidate paths from retrieve_neighbors. Stopping iteration.")
             return None, {}, pd.DataFrame(columns=['Src', 'Tgt', 'Edge']), None, True
+        
+        valid_candidate_paths = []
+        for i, p in enumerate(candidate_paths):
+            if isinstance(p, list) and len(p) == 3 and all(isinstance(item, str) for item in p):
+                valid_candidate_paths.append(p)
+            # else:
+                # print(f"  k={running_k}: Malformed path at index {i}: Type={type(p)}, Value={p}. Filtering out.")
+        
+        if not valid_candidate_paths:
+            # print(f"  k={running_k}: No valid candidate paths after filtering. Stopping iteration.")
+            return None, {}, pd.DataFrame(columns=['Src', 'Tgt', 'Edge']), None, True
+        candidate_paths = valid_candidate_paths
+        # +++ End Debugging and Robustness +++
 
         # --- 2. Prepare Embeddings ---
         try:
@@ -1701,7 +1751,7 @@ if __name__ =='__main__':
     LR = 1e-5 
     intermediate = True # 測試包含中間損失
     contrastive_learning = True # 測試包含對比損失
-    batch_size = 16 
+    batch_size = 1 
     save_model_dir = "./saved_models_mediq"
     if not os.path.exists(save_model_dir):
         os.makedirs(save_model_dir)
@@ -1750,8 +1800,8 @@ if __name__ =='__main__':
     if len(train_dataset) == 0 or len(dev_dataset) == 0:
         print("Error: dataset is empty!")
         exit()
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths)
-    dev_loader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths,num_workers=4, pin_memory=True)
+    dev_loader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths,num_workers=4, pin_memory=True)
 
     
     print("\n" + "="*30)
