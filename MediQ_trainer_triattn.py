@@ -28,7 +28,25 @@ from collections import OrderedDict, defaultdict
 
 # Placeholder for a tokenizer if not loaded globally
 # tokenizer = AutoTokenizer.from_pretrained("cambridgeltl/SapBERT-from-PubMedBERT-fulltext") # Or your model path
-
+# Try to import torch_scatter, if not available, print a warning
+try:
+    from torch_scatter import scatter_add, scatter_mean
+    TORCH_SCATTER_AVAILABLE = True
+    print("torch_scatter is available.")
+except ImportError:
+    TORCH_SCATTER_AVAILABLE = False
+    print("Warning: torch_scatter not found. GIN aggregation will be less efficient or simplified.")
+    # Define placeholder functions if torch_scatter is not available for basic functionality
+    def scatter_add(src, index, dim_size):
+        # Naive scatter_add for CPU, very inefficient for large tensors on GPU
+        # This is just a placeholder for the concept.
+        # For actual use without torch_scatter, a more optimized loop or other PyTorch ops are needed.
+        out = torch.zeros(dim_size, src.size(1), dtype=src.dtype, device=src.device)
+        # This is a simple loop, not optimized.
+        for i in range(src.size(0)):
+            out[index[i]] += src[i]
+        return out
+    
 class MediQAnnotatedDataset(Dataset):
     """
     Loads annotated MediQ data (with facts, CUIs, and pre-calculated paths)
@@ -236,58 +254,193 @@ def retrieve_phrases(paths, cui_aui_mappings):
 
 
 
-def retrieve_neighbors_paths_no_self(cui_lists, g, prev_candidate_paths_df):
-    #import queue 
-    """Important function to reformat paths and direct neighbors 
-    Input: 
-    cui_lists: a list of CUIs that start searching
-    g: current graph 
-    candidate_paths_df: if not None, it is the history one-hot path from previous traversal iteration
-    Output:
-    all_paths: a list of one-hot hop given cui_lists 
-    all_neighbors: a list of concepts that will be the candidate predictions
-    path_memories: a list of list with four elements: visited source nodes from the prev iteration; 
-                                                      starting nodes at the current iteration (aka cui_list);
-                                                      current candidate node, 
-                                                      current candidate edge 
-    """
-    cui_neighbors = retrieve_subgraphs(cui_lists, g) # dictionary of cuis and their neighrbos 
-    all_neighbors = [] 
-    all_paths = [] 
-    path_memories = [] # dict or list? 
-    path_buffer = {} # path buffer, a list of dictionary indicating what sources lead to the current target
-    if prev_candidate_paths_df is None: 
-        all_neighbors = [vv[0] for k,v in cui_neighbors.items() for vv in v if len(v) !=0] # list of neighbor nodes 
-        all_paths = [[k, vv[0], vv[1]] for k,v in cui_neighbors.items() for vv in v if len(v) !=0] # list of one-hop path
-        path_memories = [[[k], k, vv[0], vv[1]] for k,v in cui_neighbors.items() for vv in v if len(v) !=0]
-    else:
-        # faster version using itertuples 
-        for _ in  prev_candidate_paths_df.itertuples():
-            src, tgt = _.Src, _.Tgt
-            if src == tgt:
-                continue 
-            if tgt in path_buffer:
-                path_buffer[tgt].append(src)
-            else:
-                path_buffer[tgt]= [src]
-        # remove a specific path where it is the self edge at the first hop 
-        for k,v in cui_neighbors.items():
-            #print("path buffer k {path_buffer[k]} given k", )
-            if len(v) == 0:
-                continue
-            if k not in path_buffer:
-                record = [k,k,k,"self"]
-                if record not in path_memories:
-                    path_memories.append(record)
-                continue 
-            for vv in v:
-                path_memories.append([path_buffer[k], k, vv[0], vv[1]]) 
 
-        all_paths =[pm[1:] for pm in path_memories] 
-        all_neighbors =[pm[-2] for pm in path_memories]
-    #print("ALL NEIGHRBORS", all_neighbors)
-    #print("PATH MEMO: ", path_memories)
-    return all_paths, all_neighbors, path_memories  
+
+def preprocess_graph_to_tensors(graph_nx):
+    global mock_cui_to_idx, mock_edge_to_idx
+    
+    print("Preprocessing graph to tensors...")
+    nodes = sorted(list(graph_nx.nodes()))
+    mock_cui_to_idx = {cui: i for i, cui in enumerate(nodes)}
+    
+    edge_labels = sorted(list(set(data['label'] for _, _, data in graph_nx.edges(data=True) if 'label' in data)))
+    mock_edge_to_idx = {label: i for i, label in enumerate(edge_labels)}
+    if not mock_edge_to_idx and graph_nx.number_of_edges() > 0 : # Handle case with edges but no labels
+        mock_edge_to_idx["DEFAULT_REL"] = 0
+
+
+    num_nodes = len(nodes)
+    adj_src = []
+    adj_tgt = []
+    adj_edge_type = []
+
+    for u, v, data in graph_nx.edges(data=True):
+        if u in mock_cui_to_idx and v in mock_cui_to_idx:
+            adj_src.append(mock_cui_to_idx[u])
+            adj_tgt.append(mock_cui_to_idx[v])
+            label = data.get('label')
+            if label in mock_edge_to_idx:
+                adj_edge_type.append(mock_edge_to_idx[label])
+            elif "DEFAULT_REL" in mock_edge_to_idx: # Use default if label missing or unknown
+                 adj_edge_type.append(mock_edge_to_idx["DEFAULT_REL"])
+            else: # Should not happen if DEFAULT_REL is set up
+                adj_edge_type.append(0) # Fallback
+
+    target_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if not adj_src: # Handle empty graph or graph with no valid mapped edges
+        print("Warning: No valid edges found or graph is empty after preprocessing.")
+        return {
+            "num_nodes": num_nodes,
+            "cui_to_idx": mock_cui_to_idx,
+            "idx_to_cui": {i: cui for cui, i in mock_cui_to_idx.items()},
+            "edge_to_idx": mock_edge_to_idx,
+            "idx_to_edge": {i: label for label, i in mock_edge_to_idx.items()},
+            "adj_src": torch.tensor([], dtype=torch.long, device=target_device),
+            "adj_tgt": torch.tensor([], dtype=torch.long, device=target_device),
+            "adj_edge_type": torch.tensor([], dtype=torch.long, device=target_device)
+        }
+
+    tensor_graph = {
+        "num_nodes": num_nodes,
+        "cui_to_idx": mock_cui_to_idx,
+        "idx_to_cui": {i: cui for cui, i in mock_cui_to_idx.items()},
+        "edge_to_idx": mock_edge_to_idx,
+        "idx_to_edge": {i: label for label, i in mock_edge_to_idx.items()},
+        "adj_src": torch.tensor(adj_src, dtype=torch.long, device=target_device),
+        "adj_tgt": torch.tensor(adj_tgt, dtype=torch.long, device=target_device),
+        "adj_edge_type": torch.tensor(adj_edge_type, dtype=torch.long, device=target_device)
+    }
+    print(f"Preprocessing complete. Num nodes: {num_nodes}, Num edges: {len(adj_src)}")
+    return tensor_graph
+
+# --- 重構後的 retrieve_neighbors_paths_no_self_tensorized ---
+def retrieve_neighbors_paths_no_self_tensorized(
+    current_cui_str_list, 
+    tensor_graph, 
+    prev_candidate_tensors=None
+):
+    """
+    Retrieves 1-hop neighbor paths using tensor operations.
+    Args:
+        current_cui_str_list (list[str]): List of CUI strings to start searching from.
+        tensor_graph (dict): Dictionary containing tensorized graph representations
+                             (adj_src, adj_tgt, adj_edge_type, cui_to_idx, etc.).
+        prev_candidate_tensors (dict, optional): Tensors from the previous hop,
+                                                 containing 'src_indices', 'tgt_indices'.
+                                                 Used to build multi-hop path memory.
+    Returns:
+        tuple:
+            - candidate_src_indices (torch.Tensor): Source CUI indices for found 1-hop paths. [num_paths]
+            - candidate_tgt_indices (torch.Tensor): Target CUI indices for found 1-hop paths. [num_paths]
+            - candidate_edge_type_indices (torch.Tensor): Edge type indices for found 1-hop paths. [num_paths]
+            - path_memory_src_prev_hop (torch.Tensor or None): For 2+ hops, CUI indices of the *original* source
+                                                               of the paths extended in this hop. [num_paths]
+                                                               None for 1st hop.
+    """
+    if not current_cui_str_list:
+        return torch.tensor([], dtype=torch.long), \
+               torch.tensor([], dtype=torch.long), \
+               torch.tensor([], dtype=torch.long), \
+               None
+
+    cui_to_idx = tensor_graph['cui_to_idx']
+    
+    # Convert current CUI strings to indices
+    current_cui_indices = []
+    for cui_str in current_cui_str_list:
+        if cui_str in cui_to_idx:
+            current_cui_indices.append(cui_to_idx[cui_str])
+    
+    if not current_cui_indices:
+        return torch.tensor([], dtype=torch.long), \
+               torch.tensor([], dtype=torch.long), \
+               torch.tensor([], dtype=torch.long), \
+               None
+    device = tensor_graph['adj_src'].device         
+    current_cui_indices_tensor = torch.tensor(list(set(current_cui_indices)), dtype=torch.long, device=device) # Unique current sources
+
+    # Find edges originating from the current_cui_indices_tensor
+    # Create a mask for relevant source nodes in the graph's adjacency list
+    # graph_adj_src shape: [total_num_edges_in_graph]
+    # current_cui_indices_tensor shape: [num_current_sources]
+    # We want to find all edges where graph_adj_src is one of current_cui_indices_tensor
+    
+    # Efficiently find matching edges:
+    # Create a boolean mask by checking for each edge if its source is in current_cui_indices_tensor
+    # This can be slow if current_cui_indices_tensor is large.
+    # A better way for many sources: iterate through current_cui_indices_tensor and gather.
+    
+    path_src_list = []
+    path_tgt_list = []
+    path_edge_type_list = []
+    path_memory_src_prev_hop_list = [] # For 2+ hop tracking
+
+    adj_src_graph = tensor_graph['adj_src']
+    adj_tgt_graph = tensor_graph['adj_tgt']
+    adj_edge_type_graph = tensor_graph['adj_edge_type']
+
+    for i, src_idx_current_hop in enumerate(current_cui_indices_tensor):
+        # Find all edges in the graph where the source is src_idx_current_hop
+        mask_src_is_current = (adj_src_graph == src_idx_current_hop)
+        
+        if not torch.any(mask_src_is_current): # No outgoing edges from this source
+            continue
+
+        srcs_for_paths = adj_src_graph[mask_src_is_current] # These will all be src_idx_current_hop
+        tgts_for_paths = adj_tgt_graph[mask_src_is_current]
+        edge_types_for_paths = adj_edge_type_graph[mask_src_is_current]
+        
+        path_src_list.append(srcs_for_paths)
+        path_tgt_list.append(tgts_for_paths)
+        path_edge_type_list.append(edge_types_for_paths)
+
+        if prev_candidate_tensors is not None and 'src_indices_orig' in prev_candidate_tensors:
+            # If it's the second hop or more, we need to carry forward the *original* source CUI index
+            # from the path that led to `src_idx_current_hop`.
+            # `prev_candidate_tensors['tgt_indices']` contains the nodes that became sources for this hop.
+            # `prev_candidate_tensors['src_indices_orig']` contains the original sources for those paths.
+            
+            # Find which of the previous hop's target nodes matches src_idx_current_hop
+            prev_tgt_mask = (prev_candidate_tensors['tgt_indices'] == src_idx_current_hop)
+            if torch.any(prev_tgt_mask):
+                # Get the original source(s) that led to src_idx_current_hop
+                # If multiple paths led to src_idx_current_hop, we might need to duplicate or handle this.
+                # For simplicity, let's assume one main path or take the first.
+                original_source_for_this_src = prev_candidate_tensors['src_indices_orig'][prev_tgt_mask][0] # Take the first one
+                path_memory_src_prev_hop_list.append(original_source_for_this_src.repeat(srcs_for_paths.size(0)))
+            else:
+                # This case should be rare if src_idx_current_hop came from prev_candidate_tensors['tgt_indices']
+                # If src_idx_current_hop was an initial CUI, and it's not the first hop, something is off.
+                # For first hop, prev_candidate_tensors is None.
+                # Fallback: use src_idx_current_hop if original source cannot be traced
+                path_memory_src_prev_hop_list.append(src_idx_current_hop.repeat(srcs_for_paths.size(0)))
+        else: # First hop, the source of the path is the source of the memory
+            path_memory_src_prev_hop_list.append(src_idx_current_hop.repeat(srcs_for_paths.size(0)))
+
+
+    if not path_src_list: # No paths found at all
+        return torch.tensor([], dtype=torch.long), \
+               torch.tensor([], dtype=torch.long), \
+               torch.tensor([], dtype=torch.long), \
+               None
+
+    candidate_src_indices = torch.cat(path_src_list)
+    candidate_tgt_indices = torch.cat(path_tgt_list)
+    candidate_edge_type_indices = torch.cat(path_edge_type_list)
+    
+    path_memory_src_prev_hop_tensor = torch.cat(path_memory_src_prev_hop_list) if path_memory_src_prev_hop_list else None
+    
+    # Filter out self-loops (src == tgt for the current hop)
+    # This was part of "no_self" in the original name
+    non_self_loop_mask = (candidate_src_indices != candidate_tgt_indices)
+    candidate_src_indices = candidate_src_indices[non_self_loop_mask].to(device)
+    candidate_tgt_indices = candidate_tgt_indices[non_self_loop_mask].to(device)
+    candidate_edge_type_indices = candidate_edge_type_indices[non_self_loop_mask].to(device)
+    if path_memory_src_prev_hop_tensor is not None:
+        path_memory_src_prev_hop_tensor = path_memory_src_prev_hop_tensor[non_self_loop_mask].to(device)
+
+    return candidate_src_indices, candidate_tgt_indices, candidate_edge_type_indices, path_memory_src_prev_hop_tensor
+
 
 
 
@@ -351,227 +504,355 @@ def prune_paths(input_text_vec, cand_neighbors_vs, cand_neighbors_list, threshol
 
 class CuiEmbedding(object):
     """
-    Backpropagated NOT required, dictionary look-up layer  
-    This module could be used for CUI embedding (loaded from pre-trained SAPBERT vectors)
-    Module has been tested
-    Need to rewrite to read from existing embeddings 
+    Loads pre-computed CUI embeddings from a pickle file.
+    Handles values that are numpy.ndarray of shape (1, embedding_dim).
     """
-    def __init__(self, embedding_file):
-        super(CuiEmbedding, self).__init__() 
-        self.data = pickle.load(open(embedding_file, 'rb')) 
+    def __init__(self, embedding_file_path, device=torch.device('cpu')):
+        print(f"載入真實 CUI 嵌入從: {embedding_file_path}")
+        try:
+            with open(embedding_file_path, 'rb') as f:
+                self.raw_data = pickle.load(f) # CUI_str -> numpy.ndarray (1,768)
+            print(f"成功載入 {len(self.raw_data)} 個 CUI 嵌入。")
+        except FileNotFoundError:
+            print(f"錯誤：找不到 CUI 嵌入文件 {embedding_file_path}。")
+            raise
+        except Exception as e:
+            print(f"載入 CUI 嵌入文件時發生錯誤: {e}")
+            raise
+        
+        self.device = device
+        self.data = {} # 將存儲 CUI_str -> torch.Tensor [embedding_dim]
+        self.embedding_dim = None
 
-    def encode(self, cui_lists):
-        outputs = [] 
-        outputs = [torch.as_tensor(self.data[c]) for c in cui_lists] 
-        return torch.stack(outputs).squeeze(1)
+        if not self.raw_data:
+            print("警告: 載入的 CUI 嵌入數據為空。")
+            return
 
-    def update(self, cui_idx_dicts, cui_embeddings):
-        for _, c in enumerate(cui_idx_dicts): # c: CUI, v: index in embedding lookup layer 
-            self.data[c] = cui_embeddings[_,:].unsqueeze(0).detach().cpu() # something like this 
+        # Convert loaded embeddings to tensors on the target device
+        # and reshape from (1, 768) to (768)
+        for cui, emb_array in self.raw_data.items():
+            if not isinstance(cui, str):
+                print(f"警告: 發現非字串类型的 CUI key '{cui}' ({type(cui)})，已跳過。")
+                continue
 
-
-class EdgeOneHot(object):
-    """
-    Dynamically builds edge mapping from the graph and provides one-hot embeddings.
-    """
-    def __init__(self, graph: nx.DiGraph, unknown_rel_label: str = "UNKNOWN_REL"):
-        """
-        Initializes by extracting unique edge labels from the graph.
-
-        Args:
-            graph (nx.DiGraph): The NetworkX graph object.
-            unknown_rel_label (str): Label to use for edges without a 'label' attribute
-                                     or for labels encountered during lookup but not seen during init.
-        """
-        super().__init__()
-        print("動態生成 Edge Mappings from Graph...")
-        unique_edge_labels = set()
-        edge_count = 0
-        missing_label_count = 0
-        for u, v, data in graph.edges(data=True):
-            edge_count += 1
-            label = data.get('label') # Safely get the label attribute
-            if label is not None:
-                unique_edge_labels.add(label)
+            if isinstance(emb_array, np.ndarray):
+                if emb_array.shape == (1, 768): # 檢查形狀是否如您所述
+                    if self.embedding_dim is None:
+                        self.embedding_dim = emb_array.shape[1]
+                    elif self.embedding_dim != emb_array.shape[1]:
+                        print(f"警告: CUI '{cui}' 的嵌入維度 ({emb_array.shape[1]}) 與之前 ({self.embedding_dim}) 不符，已跳過。")
+                        continue
+                    
+                    # 轉換為 Tensor, squeeze, 並移動到設備
+                    self.data[cui] = torch.from_numpy(emb_array).float().squeeze(0).to(self.device)
+                else:
+                    print(f"警告: CUI '{cui}' 的 NumPy 嵌入形狀 ({emb_array.shape}) 不是預期的 (1, 768)，已跳過。")
+                    continue
+            elif isinstance(emb_array, torch.Tensor): # 如果 pkl 中直接存的是 Tensor
+                if emb_array.shape == (1, 768) or emb_array.shape == (768,):
+                    if self.embedding_dim is None:
+                        self.embedding_dim = emb_array.shape[-1]
+                    elif self.embedding_dim != emb_array.shape[-1]:
+                        print(f"警告: CUI '{cui}' 的 Tensor 嵌入維度 ({emb_array.shape[-1]}) 與之前 ({self.embedding_dim}) 不符，已跳過。")
+                        continue
+                    
+                    self.data[cui] = emb_array.float().reshape(-1).to(self.device) # Reshape to [768]
+                else:
+                    print(f"警告: CUI '{cui}' 的 Tensor 嵌入形狀 ({emb_array.shape}) 不是預期的 (1, 768) 或 (768,)，已跳過。")
+                    continue
             else:
-                missing_label_count += 1
-                unique_edge_labels.add(unknown_rel_label) # Add default label if missing
+                print(f"警告: CUI '{cui}' 的嵌入格式未知 ({type(emb_array)})，已跳過。")
+                continue
+        
+        if not self.data:
+            print("警告: 沒有成功轉換任何 CUI 嵌入。請檢查 pkl 檔案內容和格式。")
+        elif self.embedding_dim is None and self.data: # Should have been set if data exists
+             # Fallback: try to infer from first item if not set but data exists (should not happen with current logic)
+             self.embedding_dim = next(iter(self.data.values())).shape[0]
 
-        if missing_label_count > 0:
-             print(f"警告: 圖譜中有 {missing_label_count}/{edge_count} 條邊缺少 'label' 屬性。已使用 '{unknown_rel_label}' 代替。")
 
-        # Create mapping from label to index
+    def encode(self, cui_str_list: list):
+        """
+        Encodes a list of CUI strings into their embedding tensors.
+        Returns a tensor of shape [len(cui_str_list_found), embedding_dim].
+        Handles missing CUIs by returning zero vectors.
+        """
+        embeddings_list = []
+        if self.embedding_dim is None: # 如果没有任何有效嵌入被加载
+            print("錯誤: CuiEmbedding 未能確定嵌入維度。無法編碼。")
+            # 返回一个明确表示错误的形状，或者根据期望的hdim创建一个空的
+            # 假设下游期望一个hdim，即使这里无法确定，也应该返回一个有意义的空tensor
+            # 但更安全的是，如果embedding_dim未定义，表明初始化失败。
+            # 理想情况下，如果__init__后self.data为空，self.embedding_dim也应为None
+            # 这里的hdim_fallback仅用于避免在encode中直接崩溃，但表示了更深层的问题
+            hdim_fallback = 768 # 或者从一个配置中获取
+            print(f"警告: 在 encode 中回退到 hdim={hdim_fallback} 因为 self.embedding_dim 未设置。")
+            for cui_str in cui_str_list: # 即使无法查找，也为每个请求的CUI生成占位符
+                 embeddings_list.append(torch.zeros(hdim_fallback, device=self.device))
+            if not embeddings_list:
+                 return torch.empty(0, hdim_fallback, device=self.device)
+            return torch.stack(embeddings_list)
+
+
+        for cui_str in cui_str_list:
+            emb = self.data.get(cui_str)
+            if emb is not None:
+                # 確保 emb 是一維的 [embedding_dim]
+                if emb.dim() == 1 and emb.shape[0] == self.embedding_dim:
+                    embeddings_list.append(emb)
+                else:
+                    print(f"警告: CUI '{cui_str}' 的內部存儲嵌入形狀異常 ({emb.shape})，期望 ({self.embedding_dim},)。使用零向量。")
+                    embeddings_list.append(torch.zeros(self.embedding_dim, device=self.device))
+            else:
+                # print(f"警告: CUI '{cui_str}' 在嵌入字典中未找到。使用零向量代替。")
+                embeddings_list.append(torch.zeros(self.embedding_dim, device=self.device))
+
+        if not embeddings_list:
+            return torch.empty(0, self.embedding_dim, device=self.device)
+        
+        return torch.stack(embeddings_list) # 返回 [N, embedding_dim]
+
+    def to(self, device):
+        self.device = device
+        # 重新處理 self.raw_data 以確保所有 Tensor 都移動到新設備
+        new_data_on_device = {}
+        if hasattr(self, 'raw_data') and self.raw_data: # 檢查 raw_data 是否存在且非空
+            for cui, emb_array in self.raw_data.items():
+                if not isinstance(cui, str): continue
+
+                if isinstance(emb_array, np.ndarray) and emb_array.shape == (1, self.embedding_dim if self.embedding_dim else 768):
+                    new_data_on_device[cui] = torch.from_numpy(emb_array).float().squeeze(0).to(self.device)
+                elif isinstance(emb_array, torch.Tensor) and (emb_array.shape == (1, self.embedding_dim if self.embedding_dim else 768) or emb_array.shape == (self.embedding_dim if self.embedding_dim else 768,)):
+                    new_data_on_device[cui] = emb_array.float().reshape(-1).to(self.device)
+                # else: # 跳過格式不符的
+            self.data = new_data_on_device
+        else: # 如果 raw_data 為空或不存在，則嘗試移動 self.data 中的現有 Tensor (如果有的話)
+            current_data_temp = self.data.copy() # 複製以避免在迭代時修改
+            self.data = {}
+            for cui, emb_tensor in current_data_temp.items():
+                 self.data[cui] = emb_tensor.to(self.device)
+
+        return self
+
+
+class EdgeOneHot(object): # Using the dynamic one from user's code
+    def __init__(self, graph: nx.DiGraph, unknown_rel_label: str = "UNKNOWN_REL"):
+        super().__init__()
+        unique_edge_labels = set()
+        for _, _, data in graph.edges(data=True):
+            label = data.get('label')
+            unique_edge_labels.add(label if label is not None else unknown_rel_label)
+        if not unique_edge_labels and graph.number_of_edges() > 0: # If edges exist but no labels
+            unique_edge_labels.add(unknown_rel_label)
+
         self.edge_mappings = {label: i for i, label in enumerate(sorted(list(unique_edge_labels)))}
         self.num_edge_types = len(self.edge_mappings)
-        self.unknown_rel_index = self.edge_mappings.get(unknown_rel_label) # Store index for unknown/missing
-
-        print(f"完成 Edge Mappings 生成。共找到 {self.num_edge_types} 種唯一邊緣類型。")
-        # print(f"Edge Mappings: {self.edge_mappings}") # Uncomment for debugging
-
-        # Create one-hot matrix
-        self.onehot_mat = F.one_hot(torch.arange(0, self.num_edge_types), num_classes=self.num_edge_types).float() # Use float for embeddings
-
+        self.unknown_rel_index = self.edge_mappings.get(unknown_rel_label)
+        if self.num_edge_types == 0: # Handle graph with no edges or no labeled edges
+            # print("Warning: EdgeOneHot found 0 edge types. onehot_mat will be empty or minimal.")
+            # This might lead to issues if edge_dim is expected to be >0 later
+            # For now, create a minimal valid onehot_mat if num_edge_types would be 0
+            self.onehot_mat = torch.empty(0,0).float() # Or torch.zeros(1,1).float() if a min dim is needed
+        else:
+            self.onehot_mat = F.one_hot(torch.arange(0, self.num_edge_types), num_classes=self.num_edge_types).float()
     def Lookup(self, edge_labels: list):
-        """
-        Looks up one-hot vectors for a list of edge labels.
+        if self.num_edge_types == 0: # No edge types defined
+            # Return a zero tensor of expected dimensionality if possible, or empty.
+            # This depends on what PathEncoder expects as edge_feature_dim_for_path_encoder.
+            # If EdgeOneHot created a (0,0) mat, this will error.
+            # Let's assume if num_edge_types is 0, edge_dim is 0.
+            # PathEncoder should handle edge_dim=0 (e.g., not concat edge embs).
+            if hasattr(self, '_expected_edge_dim_downstream') and self._expected_edge_dim_downstream > 0:
+                 return torch.zeros(len(edge_labels), self._expected_edge_dim_downstream) # Fallback
+            return torch.empty(len(edge_labels), 0) # Correct if edge_dim is 0
 
-        Args:
-            edge_labels (list): List of edge label strings.
-
-        Returns:
-            torch.Tensor: Tensor containing one-hot embeddings for the labels.
-        """
         indices = []
         for e in edge_labels:
-            if e in self.edge_mappings:
-                indices.append(self.edge_mappings[e])
-            elif self.unknown_rel_index is not None:
-                 print(f"警告: Lookup 時遇到未知邊緣標籤 '{e}'。使用 UNKNOWN_REL 索引。")
-                 indices.append(self.unknown_rel_index)
-            else:
-                 # Should not happen if unknown_rel_label was added during init, but as a fallback:
-                 print(f"警告: Lookup 時遇到未知邊緣標籤 '{e}' 且無 UNKNOWN_REL 索引。使用索引 0。")
-                 indices.append(0) # Fallback to index 0
-
+            if e in self.edge_mappings: indices.append(self.edge_mappings[e])
+            elif self.unknown_rel_index is not None: indices.append(self.unknown_rel_index)
+            else: indices.append(0) # Fallback
         indices_tensor = torch.tensor(indices, dtype=torch.long)
-        # Ensure indices are within bounds before lookup
-        indices_tensor = torch.clamp(indices_tensor, 0, self.num_edge_types - 1)
-        vectors = self.onehot_mat[indices_tensor]
-
-        return vectors
-
+        indices_tensor = torch.clamp(indices_tensor, 0, self.num_edge_types - 1 if self.num_edge_types > 0 else 0)
+        if self.num_edge_types == 0 : # Should not happen if clamp works correctly
+            return torch.empty(len(edge_labels), 0)
+        return self.onehot_mat[indices_tensor]
 
 class MLP(nn.Module):
-    """Construct two-layer MLP-type aggreator for GIN model"""
     def __init__(self, input_dim, hidden_dim, output_dim):
         super().__init__()
-        self.linears = nn.ModuleList()
-        # two-layer MLP
-        self.mlp_layer1 = nn.Linear(input_dim, hidden_dim, bias=False) 
-        self.mlp_layer2 = nn.Linear(hidden_dim, output_dim, bias=False) 
+        self.mlp_layer1 = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.mlp_layer2 = nn.Linear(hidden_dim, output_dim, bias=False)
         nn.init.xavier_uniform_(self.mlp_layer1.weight)
         nn.init.xavier_uniform_(self.mlp_layer2.weight)
-        self.linears.append(self.mlp_layer1)
-        self.linears.append(self.mlp_layer2)
-
-        self.batch_norm = nn.BatchNorm1d((hidden_dim))
+        self.batch_norm = nn.BatchNorm1d(hidden_dim)
 
     def forward(self, x):
         h = x
-        if h.shape[0] == 1: # if only one example, dont use batchnorm 
-            h = F.relu(self.linears[0](h), inplace=True) 
+        if h.shape[0] == 1:
+            h = F.relu(self.mlp_layer1(h))
         else:
-            h = F.relu(self.batch_norm(self.linears[0](h)),inplace=True)
-        #print("MLP layer batch norm: ", h)
-        return self.linears[1](h)
+            h = F.relu(self.batch_norm(self.mlp_layer1(h)))
+        return self.mlp_layer2(h)
     
 class GINStack(nn.Module):
-    """
-    Stacking NodeAggregateGIN
-    """
-    def __init__(self, dim_h, device):
+    def __init__(self, input_node_dim, input_edge_dim, hidden_dim, output_dim_final, num_layers, device, learn_eps=False):
         super().__init__()
-        self.conv1 = NodeAggregateGIN(dim_h, dim_h, dim_h, device)
-        self.conv2 = NodeAggregateGIN(dim_h, dim_h, dim_h, device)
-        self.conv3 = NodeAggregateGIN(dim_h, dim_h, dim_h, device)
-        self.lin1 = nn.Linear(dim_h*3, dim_h)
-        self.lin2 = nn.Linear(dim_h, dim_h)
+        self.convs = nn.ModuleList()
+        current_dim = input_node_dim
+        for _ in range(num_layers):
+            self.convs.append(NodeAggregateGIN(current_dim, input_edge_dim, hidden_dim, hidden_dim, device, learn_eps=learn_eps))
+            current_dim = hidden_dim # Output of GIN layer becomes input for next
 
-    def forward(self, paths_srcs, path_tgt_edges_per_src, candidate_paths_df):
-        h1, src_dicts1 = self.conv1(paths_srcs, path_tgt_edges_per_src, candidate_paths_df)
-        h2, src_dicts2 = self.conv2(paths_srcs, path_tgt_edges_per_src, candidate_paths_df)
-        h3, src_dicts3 = self.conv3(paths_srcs, path_tgt_edges_per_src, candidate_paths_df)
+        # Linear layers to combine outputs from different GIN layers (if needed, or just use last layer's output)
+        # Original DR.KNOWS concatenated outputs of 3 layers. Here, we'll use a simpler sequential stack.
+        self.lin_out = nn.Linear(hidden_dim * num_layers, output_dim_final) # Example: concat all layer outputs
+        # Or, if just using the last layer's output:
+        # self.lin_out = nn.Linear(hidden_dim, output_dim_final)
+        self.num_layers = num_layers
 
-        h = torch.cat((h1,h2,h3), dim=1)
+    def forward(self, x_src_unique, unique_src_to_process_indices,
+                path_source_indices_global_scatter, # This is the index for scatter_add
+                path_target_node_features,
+                path_edge_features):
+        
+        layer_outputs = []
+        h = x_src_unique # Initial features for GIN layers
 
-        h = self.lin1(h)
-        h = h.relu()
-        h = F.dropout(h, p=0.5)
-        h= self.lin2(h)
-        self.src_df_dicts = self.conv1.src_df_dicts 
-
-        return h, src_dicts1 
+        for i in range(self.num_layers):
+            # Pass the current node features `h` and the neighborhood info for these nodes
+            h, _ = self.convs[i](
+                h, # current features of the unique source nodes
+                unique_src_to_process_indices, # global indices of these nodes
+                path_source_indices_global_scatter, # scatter index for paths
+                path_target_node_features,
+                path_edge_features
+            )
+            layer_outputs.append(h)
+        
+        # Concatenate outputs from all layers (like original DR.KNOWS)
+        h_concat = torch.cat(layer_outputs, dim=1)
+        final_output = self.lin_out(h_concat)
+        # Or, if only using the last layer's output:
+        # final_output = self.lin_out(h)
+        
+        return final_output, unique_src_to_process_indices
 
 class NodeAggregateGIN(nn.Module):
-    """On-the-fly neighboring aggregation for candidate nodes
-    Source: MLP-Based Graph Isomorphism (Xu, K., Hu, W., Leskovec, J., & Jegelka, S. (ICLR 2018). 
-    "How powerful are graph neural networks?")
-    Graph Isomorphism Network with Edge Features, introduced by
-    `Strategies for Pre-training Graph Neural Networks <https://arxiv.org/abs/1905.12265>
-    h_i^{(l+1)} = f_\Theta \left((1 + \epsilon) h_i^{l} +
-        \sum_{j\in\mathcal{N}(i)}\mathrm{ReLU}(h_j^{l} + e_{j,i}^{l})\right)
-    where :math:`e_{j,i}^{l}` is the edge feature.
-
-    """
-    def __init__(self, input_dim, hidden_dim, output_dim, device, init_eps=0, learn_eps=False):
+    def __init__(self, input_node_dim, input_edge_dim, hidden_dim, output_dim, device, init_eps=0, learn_eps=False):
         super().__init__()
-        self.edge_linear = nn.Linear(hidden_dim+108,hidden_dim)
-        self.aggr = MLP(input_dim, hidden_dim, output_dim) 
-        self.device = device 
-        # to specify whether eps is trainable or not.
+        # Linear layer for transforming combined (neighbor_node_feat + edge_feat)
+        self.edge_transform_linear = nn.Linear(input_node_dim + input_edge_dim, hidden_dim)
+        # MLP for aggregation
+        self.mlp = MLP(hidden_dim, hidden_dim, output_dim) # MLP aggregates sum_of_transformed_neighbors
+        self.device = device
         if learn_eps:
             self.eps = nn.Parameter(torch.FloatTensor([init_eps]))
         else:
             self.register_buffer("eps", torch.FloatTensor([init_eps]))
+        self.output_dim = output_dim
 
 
-    def message(self, path_tgt_edges_per_src, edge_dicts):
-        # \sum_{j\in\mathcal{N}(i)}\mathrm{ReLU}(h_j^{l} + e_{j,i}^{l})\right) 
-        msgs = F.relu(path_tgt_edges_per_src).to('cuda')  # same dimensionality as h_n (node embedding, which is 768)
-        msgs_dict = {}
-        for k,v in edge_dicts.items():
-            indices = torch.tensor(v).to(self.device)
-            indices = indices.to(torch.device('cuda'))
-            # print("indices: ", indices)
-            # raise NotImplementedError
-            msgs_dict[k] = torch.sum(msgs[indices], dim=0).unsqueeze(0)
+    def forward(self, x_src_unique, # [num_unique_src, src_feat_dim] - Features of source nodes to be updated
+                unique_src_to_process_indices, # [num_unique_src] - Global indices of these source nodes
+                # Information about paths/edges originating from *these* unique_src_nodes
+                path_source_indices_global,    # [total_paths_from_these_srcs] - Global index of the source for each path
+                path_target_node_features, # [total_paths_from_these_srcs, tgt_feat_dim] - Features of target nodes of these paths
+                path_edge_features         # [total_paths_from_these_srcs, edge_feat_dim] - Features of edges of these paths
+               ):
+        # `x_src_unique` are features of the nodes we want to update.
+        # `path_source_indices_global` tells us which source each path belongs to.
+        # We need to map `path_source_indices_global` to local indices relative to `x_src_unique`.
 
-        return msgs_dict 
+        if not TORCH_SCATTER_AVAILABLE:
+            # Fallback for environments without torch_scatter
+            # This will be slow and is a simplified placeholder for the logic
+            # print("GIN Fallback: Using looped aggregation (inefficient).")
+            aggregated_msgs = torch.zeros(x_src_unique.size(0), self.edge_transform_linear.out_features,
+                                          device=self.device, dtype=x_src_unique.dtype)
+            
+            # Create a mapping from global source index to its local index in x_src_unique
+            map_global_src_idx_to_local = {
+                global_idx.item(): local_idx for local_idx, global_idx in enumerate(unique_src_to_process_indices)
+            }
 
-    def organize_neighbors(self, candidate_paths_df):
-        r"""Return two dictionaries to help organize the paths and embeddings:
-        outputs: dictionary where key is the source node, values are the neighboring nodes and edges 
-        src_dicts: dictionary where key is the source node, values is the (start) index of the source node in the df  
-        """
-        outputs = {}
-        src_dicts = OrderedDict()
-        # convert df (all paths) to dict structure where key is the source node, values are the neighboring nodes and edges 
-        for rowid, item in candidate_paths_df.iterrows():
-            src = item['Src']
-            if src in outputs:
-                outputs[src].append(rowid)
-            else:
-                outputs[src] = [rowid]
-                src_dicts[src] = [rowid] 
-        return outputs, src_dicts  
+            for i in range(path_source_indices_global.size(0)):
+                src_global_idx = path_source_indices_global[i].item()
+                if src_global_idx in map_global_src_idx_to_local:
+                    src_local_idx = map_global_src_idx_to_local[src_global_idx]
+                    
+                    # Combine neighbor (target) and edge features for this path
+                    combined_neighbor_edge_feat = torch.cat(
+                        (path_target_node_features[i], path_edge_features[i]), dim=-1
+                    ).unsqueeze(0) # Add batch dim for linear layer
+                    
+                    transformed_msg = F.relu(self.edge_transform_linear(combined_neighbor_edge_feat))
+                    aggregated_msgs[src_local_idx] += transformed_msg.squeeze(0)
+        else:
+            # Efficient aggregation using torch_scatter
+            # 1. Combine target node features and edge features for all paths
+            combined_neighbor_edge_feats = torch.cat((path_target_node_features, path_edge_features), dim=-1)
+            
+            # 2. Transform these combined features (message from neighbor+edge)
+            # Output shape: [total_paths_from_these_srcs, hidden_dim]
+            transformed_messages = F.relu(self.edge_transform_linear(combined_neighbor_edge_feats))
+            
+            # 3. Aggregate messages for each source node
+            # We need to map global `path_source_indices_global` to local indices [0, num_unique_src-1]
+            # This mapping should align with `x_src_unique`.
+            # `unique_src_to_process_indices` gives the global indices of nodes in `x_src_unique`.
+            # We need to find where each `path_source_indices_global` entry falls in `unique_src_to_process_indices`.
+            
+            # A simple way if unique_src_to_process_indices is sorted and path_source_indices_global contains its elements:
+            # (This assumes path_source_indices_global are already mapped or can be mapped to 0..N-1 indices for scatter)
+            # For scatter, the `index` argument should be local indices for the output tensor.
+            
+            # Let's create the local scatter_index:
+            # map_global_to_local_idx = {global_idx.item(): i for i, global_idx in enumerate(unique_src_to_process_indices)}
+            # scatter_index = torch.tensor(
+            #     [map_global_to_local_idx[glob_idx.item()] for glob_idx in path_source_indices_global],
+            #     dtype=torch.long, device=self.device
+            # )
+            # --- More robust way to get scatter_index ---
+            # Create a "compressed" version of path_source_indices_global
+            # Example: unique_src_to_process_indices = [10, 20, 30] (global IDs)
+            #          path_source_indices_global = [10, 20, 10, 30, 20] (global IDs)
+            # We want scatter_index = [0, 1, 0, 2, 1] (local IDs relative to unique_src_to_process_indices)
+            # This can be achieved using searchsorted if unique_src_to_process_indices is sorted.
+            # Or by building a mapping.
 
-    def forward(self, paths_srcs, path_tgt_edges_per_src, candidate_paths_df):
-        #output = self.aggr(node_repr)   
-        df_edge_dicts, src_dicts = self.organize_neighbors(candidate_paths_df)
-        cand_cuis_mappings = {k: v for v, k in enumerate(set(candidate_paths_df['Src'].to_list()))}
-        sorted_cand_cuis_mappings_keys = sorted(list(cand_cuis_mappings.keys()))
-        for v,k in enumerate(sorted_cand_cuis_mappings_keys):
-            cand_cuis_mappings[k] = v  
+            # Assuming unique_src_to_process_indices is sorted for searchsorted to work efficiently
+            # If not, sort it and remember the inverse permutation if original order matters for x_src_unique.
+            # For simplicity, let's assume unique_src_to_process_indices directly corresponds to the 0..N-1 order of x_src_unique.
+            # This means path_source_indices_global should already be local indices [0, num_unique_src-1]
+            # for scatter_add's `index` argument.
+            # If path_source_indices_global are still global, they need to be mapped.
 
-        self.src_dicts = src_dicts # for debugging purporse: {CUI: index in path dataframe}
-        self.src_df_dicts = df_edge_dicts # to compute CL
-        # updated msg
-        msgs_dict = self.message(path_tgt_edges_per_src, df_edge_dicts)
-        outputs = []
-        new_src_dicts = {} 
-        count = 0
-        for k,v in src_dicts.items():
-            new_src_dicts[k] = count
-            count += 1
-            h_src = paths_srcs[cand_cuis_mappings[k]].unsqueeze(0)
-            #h_src = paths_srcs[torch.tensor(v[0]).to(self.device)] # h_src original embedding
-            h_msg = self.edge_linear(msgs_dict[k]) 
-            h_n_prime = (1 + self.eps) * h_src + h_msg 
-            outputs.append(h_n_prime)
-        raw_feats = torch.cat(outputs) 
-        #print(f"Raw Features {raw_feats.shape}")
-        output = self.aggr(raw_feats.squeeze(1))
-        return output, new_src_dicts  
+            # Let's refine this: `GraphModel.one_iteration` should prepare a `scatter_src_index`
+            # that directly maps paths to the 0..N-1 indices of `x_src_unique`.
+            # For this example, let's assume `path_source_indices_global` IS this scatter_index.
+            # (This means GraphModel needs to prepare it correctly based on map_src_idx_to_unique_emb_idx)
+
+            if path_source_indices_global.max() >= x_src_unique.size(0):
+                 print(f"Error: scatter index max {path_source_indices_global.max()} out of bounds for dim_size {x_src_unique.size(0)}")
+                 # Handle error or return
+                 # For now, fallback to un-updated features or zeros
+                 updated_src_features = self.mlp(x_src_unique) # Or just x_src_unique
+                 return updated_src_features, unique_src_to_process_indices # Return global indices
+
+
+            aggregated_msgs = scatter_add(
+                transformed_messages,         # Embeddings of all neighbors+edges
+                path_source_indices_global,   # Index mapping each neighbor+edge to its source node (0 to N-1)
+                dim=0,                        # Aggregate along dimension 0
+                dim_size=x_src_unique.size(0) # Size of the output tensor (num unique source nodes)
+            ) # Shape: [num_unique_src, hidden_dim]
+            
+        # GIN update rule
+        # print(f"x_src_unique device: {x_src_unique.device}, aggregated_msgs device: {aggregated_msgs.device}, eps device: {self.eps.device}")
+        updated_src_features = (1 + self.eps) * x_src_unique + aggregated_msgs
+        updated_src_features = self.mlp(updated_src_features)
+
+        return updated_src_features, unique_src_to_process_indices # Return updated features and their global indices
 
 
 class PathEncoder(nn.Module):
@@ -737,754 +1018,669 @@ class PathRanker(nn.Module):
 
 class GraphModel(nn.Module):
     def __init__(self,
-                 g,
-                 cui_embedding, # cui_objects
+                 g_nx, # NetworkX graph for preprocessing
+                 cui_embedding_lookup, # CuiEmbedding object (lookup by CUI string)
                  hdim,
-                 nums_of_head, # Note: May not be used by TriAttn rankers
-                 # edges_dicts, # edge name to index mapping for EdgeOneHot
-                 # cui_aui_mappings, # Original mapping, potentially unused now
-                 nums_of_hops, # Should be fixed to 2 based on prior discussion
+                 nums_of_head,
+                 num_hops, # Max hops
                  top_n,
                  device,
-                 cui_weights=None,
-                 gnn_update=True, # Use GIN?
-                 cui_flag=True, # Used by original PathRanker, maybe not TriAttn
-                 path_encoder_type="MLP", # "MLP" or "Transformer"
-                 path_ranker_type="Flat", # "Flat" or "Combo"
-                 gnn_type="Stack", # "Stack" or "Single"
-                 prune_thsh=0.8): # Original prune threshold, maybe unused now
+                 cui_weights_dict=None, # Dict: CUI_str -> weight
+                 gnn_update=True,
+                 path_encoder_type="MLP",
+                 path_ranker_type="Flat",
+                 gnn_type="Stack",
+                 gin_hidden_dim=None,
+                 gin_num_layers=1,
+                 input_edge_dim_for_gin=108
+                 ):
         super(GraphModel, self).__init__()
-        self.n_encoder = cui_embedding # CuiEmbedding object
-        self.e_encoder = EdgeOneHot(graph=g) # EdgeOneHot object
-        self.edges_mappings = self.e_encoder.edge_mappings
+        self.g_tensorized = preprocess_graph_to_tensors(g_nx) # Preprocess NX graph
+        self.n_encoder_lookup = cui_embedding_lookup # For string CUI to embedding
+        
+        # Edge encoder needs the tensorized graph's edge_to_idx for dynamic mapping
+        # Or, if EdgeOneHot is modified to take graph_nx and build its own mapping:
+        self.e_encoder = EdgeOneHot(graph=g_nx) # Assumes EdgeOneHot can handle NX graph
+        # self.edge_idx_map = self.g_tensorized['edge_to_idx'] # No longer needed if e_encoder handles it
+
         self.p_encoder_type = path_encoder_type
         self.path_ranker_type = path_ranker_type
+        
+        edge_dim = self.e_encoder.onehot_mat.shape[-1]
 
-        # Instantiate Path Encoder based on type
-        # Note: Original encoders expect specific inputs (src_emb, tgt+edge_emb).
-        # If encoding pre-calculated paths differently, this might need adjustment later.
         if self.p_encoder_type == "Transformer":
-            # Transformer version expects edge dim + node dim = path_dim
-            edge_dim = self.e_encoder.onehot_mat.shape[-1] if self.e_encoder else 0
             self.p_encoder = PathEncoderTransformer(hdim, hdim + edge_dim)
-        else: # Default to MLP version
-            edge_dim = self.e_encoder.onehot_mat.shape[-1] if self.e_encoder else 0
+        else:
             self.p_encoder = PathEncoder(hdim, hdim + edge_dim)
 
-        # Instantiate Path Ranker based on type
         if self.path_ranker_type == "Combo":
             self.p_ranker = TriAttnCombPathRanker(hdim)
-        else: # Default to Flat version
+        else:
             self.p_ranker = TriAttnFlatPathRanker(hdim)
 
-        self.g = g # networkx graph object
-        self.k = nums_of_hops # max k hops (should be 2)
-        self.path_per_batch_size = 128 # Batch size for processing paths internally
+        self.k_hops = num_hops
+        self.path_per_batch_size = 128
         self.top_n = top_n
-        # self.logit_loss_mode = "last" # Original param, maybe remove if loss handled in Trainer
-        self.cui_weights = cui_weights # Dictionary mapping CUI -> weight
-
-        # self.edges_mappings = edges_dicts # Keep for e_encoder
-        # self.visited_paths = {} # Tracks paths to selected CUIs (CUI -> path string)
-        # self.src_cui_emb = {} # Tracks embeddings used to reach selected CUIs (CUI -> embedding tensor)
+        self.cui_weights_dict = cui_weights_dict if cui_weights_dict else {}
+        self.hdim = hdim # Store hdim for use
         self.device = device
-        # self.candidate_paths_df = None # Stores DataFrame of paths found in the current hop
         self.gnn_update = gnn_update
-        # self.prune_thsh = prune_thsh # Store if prune_paths util is used
         self.gnn_type = gnn_type
-
-        # Instantiate GNN based on type if gnn_update is True
+        self.gin_num_layers = gin_num_layers if gin_num_layers else (3 if gnn_type == "Stack" else 1)
+        self.gin_hidden_dim = gin_hidden_dim if gin_hidden_dim else hdim
+        self.input_edge_dim_for_gin = input_edge_dim_for_gin # Should match e_encoder output
         if self.gnn_update:
             if self.gnn_type == "Stack":
-                self.gnn = GINStack(hdim, self.device)
-            else: # Default to single layer GIN
-                self.gnn = NodeAggregateGIN(hdim, hdim, hdim, self.device)
+                # GINStack input_node_dim is hdim, output_dim_final is hdim
+                self.gnn = GINStack(
+                    input_node_dim=hdim,
+                    input_edge_dim=self.input_edge_dim_for_gin, # From e_encoder
+                    hidden_dim=self.gin_hidden_dim,
+                    output_dim_final=hdim, # GIN output should be hdim to match other embs
+                    num_layers=self.gin_num_layers,
+                    device=device
+                )
+            else: # Single GIN layer
+                self.gnn = NodeAggregateGIN(
+                    input_node_dim=hdim,
+                    input_edge_dim=self.input_edge_dim_for_gin,
+                    hidden_dim=self.gin_hidden_dim,
+                    output_dim=hdim, # Output should be hdim
+                    device=device
+                )
         else:
-             self.gnn = None # No GNN if update is false
-
-    def one_iteration(self, task_emb, cui_lists, running_k, context_emb=None, prev_candidate_paths_df=None, prev_visited_paths_str=None):
-        """
-        執行一輪迭代：查找鄰居 -> 更新/獲取源嵌入 -> 編碼路徑 -> 評分 -> 選擇TopN
-        Args:
-            task_emb: 當前任務/文本嵌入
-            cui_lists: 當前迭代的起始 CUI 列表
-            running_k: 當前是第幾跳 (0 or 1 for k=2)
-            context_emb: 上下文 CUI 嵌入
-            prev_candidate_paths_df: 上一輪的 candidate_paths_df (用於 retrieve_neighbors_paths_no_self)
-            prev_visited_paths_str: 上一輪選出的 visited_paths (CUI -> path string 字典)
-        Returns:
-            final_scores: 當前跳找到的路徑的分數 Tensor
-            visited_paths_next_hop: 選出的 TopN CUIs 及其對應路徑字符串 (字典)
-            candidate_paths_df: 當前跳找到的所有路徑的 DataFrame
-            visited_path_embs_tensor: 當前跳所有路徑的嵌入 Tensor (for Triplet Loss)
-            stop_flag: 是否提前停止
-        """
-        stop_flag = False # Reset stop flag for this iteration
-
-        # 1. Dynamic neighbor finding using the utility function
-        candidate_paths, candidate_neighbors, path_memories = retrieve_neighbors_paths_no_self(
-            cui_lists, self.g, prev_candidate_paths_df # 使用上一輪的 df
-        )
-        '''
-        # +++ Debugging: Check raw candidate_paths +++
-        print(f"\n--- Debug Info (Inside one_iteration, k={running_k}, Start) ---")
-        print(f"Input cui_lists (first 10): {cui_lists[:10]}")
-        print(f"Number of candidate_paths from retrieve_neighbors: {len(candidate_paths)}")
-        malformed_paths_found = False
-        for i, p in enumerate(candidate_paths):
-             # More robust check: is it a list of 3 strings?
-             if not (isinstance(p, list) and len(p) == 3 and all(isinstance(item, str) for item in p)):
-                print(f"  !!! Malformed path found at index {i}: Type={type(p)}, Value={p}")
-                malformed_paths_found = True
-        if not malformed_paths_found:
-             print("  All candidate_paths seem correctly formatted (list of 3 strings).")
-        else:
-             print("  !!! Found malformed paths in candidate_paths list !!!")
-             # Decide how to handle: filter or return error? Let's filter for now
-             original_count = len(candidate_paths)
-             candidate_paths = [p for p in candidate_paths if isinstance(p, list) and len(p) == 3 and all(isinstance(item, str) for item in p)]
-             print(f"  Filtered malformed paths. Count reduced from {original_count} to {len(candidate_paths)}.")
-        # +++ End Check +++
-        '''
-        if not candidate_paths:
-            print(f"  No valid candidate paths found after filtering or initially.")
-            return None, {}, pd.DataFrame(columns=['Src', 'Tgt', 'Edge']), None, True
-
-        # --- 2. Prepare Embeddings ---
-        try:
-            candidate_paths_df = pd.DataFrame(candidate_paths, columns=['Src', 'Tgt', 'Edge'])
-            # print(f"  Successfully created candidate_paths_df, shape: {candidate_paths_df.shape}")
-            # path_mem_df is needed only if using Transformer PathEncoder with multi-source memory
-            # path_mem_df = pd.DataFrame(path_memories, columns=['Prev','Src', 'Tgt', 'Edge'])
-        except ValueError as e:
-            print(f"!!! Error creating DataFrame from candidate_paths: {e} !!!")
-            print(f"Problematic candidate_paths list (first 10 entries): {candidate_paths[:10]}")
-            return None, {}, pd.DataFrame(columns=['Src', 'Tgt', 'Edge']), None, True
+            self.gnn = None
         
-        unique_neighbors = list(set(candidate_neighbors))
-        unique_srcs = list(set(candidate_paths_df['Src'].tolist())) # Current hop's source nodes
+        
 
-        if not unique_neighbors or not unique_srcs:
-            return None, {}, candidate_paths_df, None, True
-
-        cand_neighbors_mappings = {cui: i for i, cui in enumerate(unique_neighbors)}
-        cand_src_mappings = {cui: i for i, cui in enumerate(unique_srcs)}
-
+    def _get_embeddings_by_indices(self, cui_indices_tensor):
+        """Helper to get embeddings for a tensor of CUI indices."""
+        if cui_indices_tensor is None or cui_indices_tensor.numel() == 0:
+            return torch.tensor([], device=self.device) # Return empty tensor on device
+        
+        # Convert indices back to CUI strings for lookup (inefficient, but uses existing n_encoder_lookup)
+        # Ideal: n_encoder_lookup.encode_by_idx(cui_indices_tensor)
+        idx_to_cui_map = self.g_tensorized['idx_to_cui']
+        cui_strings = [idx_to_cui_map.get(idx.item()) for idx in cui_indices_tensor]
+        
+        # Filter out None if any index was not in map (should not happen if indices are from graph)
+        valid_cui_strings = [s for s in cui_strings if s is not None]
+        if not valid_cui_strings:
+            return torch.tensor([], device=self.device)
+            
+        # This will return a tensor of shape [num_valid_cuis, 1, hdim] if encode expects list
+        # or [num_valid_cuis, hdim] if it handles batching.
+        # CuiEmbedding.encode returns [N, 1, D], so squeeze later.
         try:
-            # Always get base embeddings for neighbors and sources using n_encoder
-            cand_neighbors_vs = self.n_encoder.encode(unique_neighbors).to(self.device)
-            cand_src_vs_base = self.n_encoder.encode(unique_srcs).to(self.device) # Base embeddings, no grad needed yet
+            embeddings = self.n_encoder_lookup.encode(valid_cui_strings).to(self.device) # Ensure on device
+            # We need to map these back to the original order of cui_indices_tensor if some were invalid
+            # For now, assume all indices map to valid CUIs and are found by encode
+            if len(valid_cui_strings) != cui_indices_tensor.numel():
+                 print(f"Warning: Some CUI indices could not be mapped or embedded. Original: {cui_indices_tensor.numel()}, Valid: {len(valid_cui_strings)}")
+                 # This part is tricky: how to create a tensor of correct size with zeros for missing?
+                 # For simplicity, we proceed with only valid embeddings. This might break downstream if sizes don't match.
+                 # A robust solution would involve creating a zero tensor and filling it.
+            return embeddings.squeeze(1) # Shape [N, D]
         except KeyError as e:
-            print(f"Error encoding CUI at hop {running_k}: {e}. Skipping iteration.")
-            return None, {}, candidate_paths_df, None, True
+            print(f"KeyError during embedding lookup in _get_embeddings_by_indices: {e}")
+            return torch.tensor([], device=self.device)
         except Exception as e:
-             print(f"Unexpected error encoding CUIs at hop {running_k}: {e}")
-             return None, {}, candidate_paths_df, None, True
-
-        # Apply CUI weights only at the first hop (k=0)
-        if running_k == 0 and self.cui_weights:
-             starting_cui_weights = torch.tensor([self.cui_weights.get(c, 1.0) for c in unique_srcs], device=self.device).unsqueeze(1)
-             cand_src_vs = cand_src_vs_base * starting_cui_weights
-        else:
-             cand_src_vs = cand_src_vs_base # Use base embeddings for k > 0 or if no weights
-
-        # Prepare edge embeddings and combined target+edge embeddings
-        all_paths_tgt_edges_embs = []
-        edge_mapping_keys = self.edges_mappings.keys() if self.e_encoder else set()
-        for i in range(len(candidate_paths_df)):
-            target_cui = candidate_paths_df.iloc[i]['Tgt']
-            edge_label = candidate_paths_df.iloc[i]['Edge']
-
-            # Get target CUI embedding
-            tgt_emb = cand_neighbors_vs[cand_neighbors_mappings[target_cui]].unsqueeze(0)
-
-            # Get edge embedding (use zero vector if no encoder or label unknown)
-            if self.e_encoder and edge_label in edge_mapping_keys:
-                edge_idx = self.edges_mappings[edge_label]
-                # Ensure index is valid before lookup
-                if 0 <= edge_idx < len(self.e_encoder.onehot_mat):
-                    e_emb = self.e_encoder.onehot_mat[edge_idx].unsqueeze(0).float().to(self.device) # Ensure float and on device
-                else:
-                    print(f"Warning: Invalid edge index {edge_idx} for label {edge_label}. Using zero vector.")
-                    e_emb = torch.zeros(1, self.e_encoder.onehot_mat.shape[-1], device=self.device) # Zero vector
-            else:
-                 # Get dimensionality if possible, otherwise use a default?
-                 edge_dim = self.e_encoder.onehot_mat.shape[-1] if self.e_encoder else 1 # Use 1 if no encoder
-                 e_emb = torch.zeros(1, edge_dim, device=self.device)
-
-            # Combine target and edge embeddings
-            # Ensure dimensions match PathEncoder expectation (hdim + edge_dim)
-            if tgt_emb.shape[1] + e_emb.shape[1] != self.p_encoder.tgt_weights.in_features: # Check input dim of PathEncoder's target linear layer
-                  print(f"Warning: Dimension mismatch for PathEncoder input. Tgt emb shape: {tgt_emb.shape}, Edge emb shape: {e_emb.shape}, Expected combined dim: {self.p_encoder.tgt_weights.in_features}")
-                  # Fallback: maybe just use target embedding? or zero vector?
-                  # For now, let's create a combined tensor trying to match dimensions, potentially with zeros
-                  expected_dim = self.p_encoder.tgt_weights.in_features
-                  combined_emb = torch.zeros(1, expected_dim, device=self.device)
-                  len_tgt = min(expected_dim, tgt_emb.shape[1])
-                  combined_emb[0, :len_tgt] = tgt_emb[0, :len_tgt]
-                  if expected_dim > len_tgt and e_emb.shape[1] > 0:
-                      len_edge = min(expected_dim - len_tgt, e_emb.shape[1])
-                      combined_emb[0, len_tgt : len_tgt + len_edge] = e_emb[0, :len_edge]
-
-                  # combined_emb = torch.cat((tgt_emb, e_emb), dim=-1) # Original simple concat
-            else:
-                 combined_emb = torch.cat((tgt_emb, e_emb), dim=-1)
+            print(f"Unexpected error in _get_embeddings_by_indices: {e}")
+            return torch.tensor([], device=self.device)
 
 
-            all_paths_tgt_edges_embs.append(combined_emb)
+    def one_iteration(self,
+                      task_emb_batch, # Shape [1, hdim] or [hdim] for a single sample
+                      current_cui_str_list, # List of CUI strings for current hop's start nodes
+                      running_k_hop, # Current hop number (0 for 1st hop)
+                      context_emb_batch=None, # Shape [1, hdim] or [hdim]
+                      prev_iteration_state=None # Dict: {'cand_src_orig_idx': Tensor, 'cand_tgt_idx': Tensor}
+                     ):
+        stop_flag = False
+        
+        # 1. Retrieve 1-hop paths using tensorized function
+        # prev_candidate_tensors in retrieve_... is prev_iteration_state
+        cand_src_idx_hop, cand_tgt_idx_hop, cand_edge_idx_hop, mem_orig_src_idx_hop = \
+            retrieve_neighbors_paths_no_self_tensorized(
+                current_cui_str_list,
+                self.g_tensorized,
+                prev_iteration_state 
+            )
 
-        if not all_paths_tgt_edges_embs:
-             return None, {}, candidate_paths_df, None, True # Stop if no valid path components generated
+        if cand_src_idx_hop.numel() == 0: # No paths found
+            return None, {}, None, True # Scores, next_hop_dict, path_tensors, mem_tensors, stop_flag
 
-        paths_tgt_edges = torch.cat(all_paths_tgt_edges_embs) # Shape [num_paths, hdim + edge_dim]
+        # --- 2. Prepare Embeddings for this Hop ---
+        # Unique source and target CUI indices for this hop's paths
+        unique_hop_src_indices = torch.unique(cand_src_idx_hop)
+        unique_hop_tgt_indices = torch.unique(cand_tgt_idx_hop)
 
-        # --- 3. Optional: Update Source Embeddings with GIN ---
+        # Get embeddings for these unique CUIs
+        # These are the base embeddings before GIN (if any)
+        unique_src_embs_base = self._get_embeddings_by_indices(unique_hop_src_indices)
+        unique_tgt_embs = self._get_embeddings_by_indices(unique_hop_tgt_indices)
+
+        if unique_src_embs_base.numel() == 0 or unique_tgt_embs.numel() == 0:
+            # print(f"Debug: Failed to get base embeddings for src or tgt at hop {running_k_hop}")
+            return None, {}, None, True
+            
+        map_global_src_idx_to_local_in_unique = {
+            glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_src_indices)
+        }
+        # This scatter_index maps each path's global source CUI to its 0..N-1 index within unique_hop_src_indices
+        scatter_src_index_for_gin_agg = torch.tensor(
+            [map_global_src_idx_to_local_in_unique[glob_idx.item()] for glob_idx in cand_src_idx_hop],
+            dtype=torch.long, device=self.device
+        )
+
+        # Get edge embeddings for all paths
+        # EdgeOneHot.Lookup expects list of labels, convert cand_edge_idx_hop back to labels
+        idx_to_edge_map = self.g_tensorized['idx_to_edge']
+        edge_labels_for_paths = [idx_to_edge_map.get(idx.item(), "UNKNOWN_REL_LOOKUP") for idx in cand_edge_idx_hop]
+        path_edge_embs_for_gin_and_path_enc = self.e_encoder.Lookup(edge_labels_for_paths).to(self.device)
+
+
+        current_path_src_embs_for_encoding = unique_src_embs_base.clone()
+        if running_k_hop == 0 and self.cui_weights_dict:
+            weights = torch.tensor(
+                [self.cui_weights_dict.get(self.g_tensorized['idx_to_cui'].get(idx.item()), 1.0)
+                 for idx in unique_hop_src_indices], device=self.device
+            ).unsqueeze(1)
+            current_path_src_embs_for_encoding = current_path_src_embs_for_encoding * weights
+        
+        
+        # --- 3. Optional GNN Update on current_path_src_embs ---
+        # This part is complex to tensorize fully without specific GIN assumptions.
+        # We need to aggregate target+edge features for each source in unique_hop_src_indices.
         if self.gnn_update and self.gnn:
-            try:
-                # GIN requires source embeddings, combined target+edge embeddings per source, and the path df
-                # Note: GIN's forward expects paths_srcs (cand_src_vs), path_tgt_edges_per_src (paths_tgt_edges), candidate_paths_df
-                h_gnn_outputs, updated_node_dicts = self.gnn(cand_src_vs, paths_tgt_edges, candidate_paths_df)
-                # Map GNN output back to the order needed for PathEncoder based on the path dataframe
-                update_cui_idx_in_hgnn = updated_node_dicts # Assuming dict maps CUI -> index in h_gnn_outputs
-                paths_srcs_for_encoder = torch.stack([
-                    h_gnn_outputs[update_cui_idx_in_hgnn[candidate_paths_df.iloc[i]['Src']]]
-                    for i in range(len(candidate_paths_df))
-                    if candidate_paths_df.iloc[i]['Src'] in update_cui_idx_in_hgnn # Ensure Src exists
-                ])
-                # Adjust paths_tgt_edges to match filtered paths_srcs_for_encoder
-                paths_tgt_edges = torch.stack([
-                    all_paths_tgt_edges_embs[i].squeeze(0) # Need to manage dimensions here
-                    for i in range(len(candidate_paths_df))
-                     if candidate_paths_df.iloc[i]['Src'] in update_cui_idx_in_hgnn
-                ])
-                # Update the candidate_paths_df to only include rows where Src was updated by GNN
-                valid_rows_idx = [i for i, row in candidate_paths_df.iterrows() if row['Src'] in update_cui_idx_in_hgnn]
-                candidate_paths_df = candidate_paths_df.loc[valid_rows_idx].reset_index(drop=True)
+            # Prepare inputs for GIN:
+            # x_src_unique: current_path_src_embs_for_encoding (features of unique source nodes)
+            # unique_src_to_process_indices: unique_hop_src_indices (global indices of these source nodes)
+            # path_source_indices_global_scatter: scatter_src_index_for_gin_agg (local indices for scatter)
+            # path_target_node_features: Features of target nodes for *all paths*
+            #    Need to get these from unique_tgt_embs based on cand_tgt_idx_hop
+            map_global_tgt_idx_to_local_in_unique = {
+                 glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices)
+            }
+            gin_path_tgt_node_features = unique_tgt_embs[
+                torch.tensor([map_global_tgt_idx_to_local_in_unique[glob_idx.item()] for glob_idx in cand_tgt_idx_hop],
+                             dtype=torch.long, device=self.device)
+            ]
+            # path_edge_features: path_edge_embs_for_gin_and_path_enc
 
-            except Exception as e:
-                 print(f"Error during GNN update: {e}")
-                 # Fallback to using non-updated embeddings or stop? Let's fallback.
-                 paths_srcs_for_encoder = torch.stack([
-                    cand_src_vs[cand_src_mappings[candidate_paths_df.iloc[i]['Src']]]
-                    for i in range(len(candidate_paths_df))
-                 ])
-                 paths_tgt_edges = torch.cat(all_paths_tgt_edges_embs) # Use original combined embs
-        else: # No GNN update
-            # Prepare source embeddings for PathEncoder - needs one embedding per path instance
-             paths_srcs_for_encoder = torch.stack([
-                cand_src_vs[cand_src_mappings[candidate_paths_df.iloc[i]['Src']]]
-                for i in range(len(candidate_paths_df))
-             ])
-             paths_tgt_edges = torch.cat(all_paths_tgt_edges_embs) # Use original combined embs
+            # Ensure edge features have the dimension expected by GIN
+            if path_edge_embs_for_gin_and_path_enc.shape[-1] != self.input_edge_dim_for_gin:
+                print(f"Warning: Edge feature dim mismatch for GIN. Got {path_edge_embs_for_gin_and_path_enc.shape[-1]}, expected {self.input_edge_dim_for_gin}. Adjusting...")
+                # This might involve padding or truncation, or re-configuring GIN's input_edge_dim
+                # For now, let's try to use it as is if GIN's edge_transform_linear can handle it,
+                # or error out, or use a subset/zeroes. This needs careful handling.
+                # A simple fix if GIN expects specific dim is to ensure e_encoder produces that.
+                # For this test, we'll assume it matches or GIN handles it.
+                # If they must match, then self.e_encoder.onehot_mat.shape[-1] must be input_edge_dim_for_gin.
+                # This is now set during GraphModel init.
+
+            updated_src_embs_from_gin, _ = self.gnn(
+                current_path_src_embs_for_encoding, # x_src_unique
+                unique_hop_src_indices,             # unique_src_to_process_indices (global IDs)
+                scatter_src_index_for_gin_agg,      # path_source_indices_global_scatter (local IDs for scatter)
+                gin_path_tgt_node_features,         # path_target_node_features
+                path_edge_embs_for_gin_and_path_enc # path_edge_features
+            )
+            current_path_src_embs_for_encoding = updated_src_embs_from_gin
+            # print(f"GIN updated src embs shape: {current_path_src_embs_for_encoding.shape}")
+
+        # --- 4. Prepare inputs for PathEncoder ---
+        # We need one source embedding and one (target+edge) embedding for each path in cand_src_idx_hop
+        
+        # --- PathEncoder Input Prep ---
+        path_specific_src_embs = current_path_src_embs_for_encoding[
+            torch.tensor([map_global_src_idx_to_local_in_unique[idx.item()] for idx in cand_src_idx_hop],
+                         dtype=torch.long, device=self.device)
+        ]
+        
+        map_global_tgt_idx_to_local_in_unique = { # Re-define or ensure scope
+             glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices)
+        }
+        path_specific_tgt_embs = unique_tgt_embs[
+            torch.tensor([map_global_tgt_idx_to_local_in_unique[idx.item()] for idx in cand_tgt_idx_hop],
+                         dtype=torch.long, device=self.device)
+        ]
+        
+        # Combined (target + edge) embeddings for PathEncoder input
+        # path_edge_embs is already [num_paths, edge_dim]
+        # path_specific_tgt_embs is [num_paths, hdim]
+        # Ensure dimensions are broadcastable or correctly concatenated.
+        # PathEncoder expects tgt_input_dim = hdim + edge_dim.
+        try:
+            combined_tgt_edge_embs_for_path_enc = torch.cat(
+                (path_specific_tgt_embs, path_edge_embs_for_gin_and_path_enc), dim=-1
+            )
+        except RuntimeError as e:
+            print(f"Error PathEnc concat: {e}, tgt_shape: {path_specific_tgt_embs.shape}, edge_shape: {path_edge_embs_for_gin_and_path_enc.shape}")
+            return None, {}, None, None, True
 
 
-        # --- 4. Path Encoding and Ranking ---
-        B = paths_tgt_edges.shape[0]
-        if B == 0:
-             return None, {}, candidate_paths_df, None, True
+        # --- 5. Path Encoding and Ranking ---
+        num_paths_this_hop = cand_src_idx_hop.size(0)
+        all_path_scores_hop, all_encoded_paths_hop = [], []
 
-        path_scores = []
-        visited_path_embs_list = []
-        all_indices = torch.arange(0, B, device=self.device)
+        for i in range(0, num_paths_this_hop, self.path_per_batch_size):
+            s_ = slice(i, min(i + self.path_per_batch_size, num_paths_this_hop))
+            src_b, combined_tgt_edge_b = path_specific_src_embs[s_], combined_tgt_edge_embs_for_path_enc[s_]
+            
+            encoded_b = self.p_encoder(src_b, combined_tgt_edge_b)
+            if self.p_encoder_type == "Transformer" and encoded_b.dim() == 3:
+                encoded_b = encoded_b.squeeze(1)
+            all_encoded_paths_hop.append(encoded_b)
+            
+            task_exp_b = task_emb_batch.expand(encoded_b.size(0), -1)
+            ctx_exp_b = context_emb_batch.expand(encoded_b.size(0), -1) if context_emb_batch is not None else task_exp_b
+            scores_b = self.p_ranker(task_exp_b, ctx_exp_b, encoded_b)
+            all_path_scores_hop.append(scores_b)
 
-        for i in range(0, B, self.path_per_batch_size):
-            indices = all_indices[i : i + self.path_per_batch_size]
-            src_embs_batch = paths_srcs_for_encoder[indices]
-            path_tgt_edge_embs_batch = paths_tgt_edges[indices]
+        if not all_path_scores_hop: return None, {}, None, None, True
+        final_scores_hop = torch.cat(all_path_scores_hop, dim=0)
+        encoded_paths_tensor_hop = torch.cat(all_encoded_paths_hop, dim=0)
 
-            # Encode paths -> path_h should require grad if p_encoder is trainable
-            path_h = self.p_encoder(src_embs_batch, path_tgt_edge_embs_batch)
-            visited_path_embs_list.append(path_h) # Store path embedding (requires_grad=True)
+        # --- 6. Top-N Selection ---
+        top_n_val = min(self.top_n, final_scores_hop.size(0))
+        if top_n_val == 0: return None, {}, None, None, True # No paths to select if final_scores_hop is empty
+        
+        _, top_k_indices = torch.topk(final_scores_hop.squeeze(-1), top_n_val, dim=0)
+        
+        sel_tgt_idx = cand_tgt_idx_hop[top_k_indices]
+        sel_src_idx_thishop = cand_src_idx_hop[top_k_indices] # For debug/path string
+        sel_edge_idx = cand_edge_idx_hop[top_k_indices] # For debug/path string
+        sel_mem_orig_src_idx = mem_orig_src_idx_hop[top_k_indices] if mem_orig_src_idx_hop is not None else None
 
-            # Rank paths -> scores should require grad if path_h or ranker params are trainable
-            exp_task_emb = task_emb.expand(path_h.shape[0], -1)
-            # Use context_emb (no grad) or task_emb (grad) for h_con input
-            exp_context_emb_ranker = context_emb.expand(path_h.shape[0], -1) if context_emb is not None else exp_task_emb
-            scores = self.p_ranker(exp_task_emb, exp_context_emb_ranker, path_h)
-            path_scores.append(scores)
+        all_paths_info = {"scores": final_scores_hop, "encoded_embeddings": encoded_paths_tensor_hop,
+                          "src_idx": cand_src_idx_hop, "tgt_idx": cand_tgt_idx_hop,
+                          "edge_idx": cand_edge_idx_hop, "mem_orig_src_idx": mem_orig_src_idx_hop}
+        next_hop_state = {"selected_src_orig_idx": sel_mem_orig_src_idx,
+                          "selected_hop_target_idx": sel_tgt_idx}
+        
+        # Path string construction (for debug, CPU-bound)
+        visited_paths_str_dict = {}
+        # idx_to_cui = self.g_tensorized['idx_to_cui'] # Already defined
+        # idx_to_edge = self.g_tensorized['idx_to_edge']
+        # for i in range(sel_tgt_idx.size(0)):
+        #     tgt_s = idx_to_cui.get(sel_tgt_idx[i].item())
+        #     src_s = idx_to_cui.get(sel_src_idx_thishop[i].item()) # Src of current hop path
+        #     edge_s = idx_to_edge.get(sel_edge_idx[i].item())
+        #     if tgt_s: visited_paths_str_dict[tgt_s] = f"... -> {src_s} --({edge_s})--> {tgt_s}"
+        
+        return all_paths_info, visited_paths_str_dict, next_hop_state, stop_flag
 
-        final_scores = torch.cat(path_scores, dim=0) if path_scores else None
-        visited_path_embs_tensor = torch.cat(visited_path_embs_list, dim=0) if visited_path_embs_list else None # Has grad history
-
-        # --- 5. Top-N Selection (Pruning for next hop) ---
-        if final_scores is None or final_scores.numel() == 0:
-             return final_scores, {}, candidate_paths_df, visited_path_embs_tensor, True
-
-        num_paths_found = final_scores.shape[0]
-        current_top_n = min(self.top_n, num_paths_found)
-        vals, pred_indices = torch.topk(final_scores, current_top_n, dim=0)
-        valid_pred_indices_np = pred_indices.squeeze().cpu().numpy()
-
-        # Get embeddings of the selected paths
-        top_path_embs = visited_path_embs_tensor[valid_pred_indices_np] if visited_path_embs_tensor is not None else None
-
-        # Select top candidate rows/row using the numpy indices
-        # This might return a DataFrame OR a Series
-        top_candidate_selection = candidate_paths_df.iloc[valid_pred_indices_np.tolist()]
-
-        # --- 6. Prepare outputs for Trainer ---
-        visited_paths_next_hop = {} # CUI -> path string dict for next iteration's state
-
-        if top_path_embs is not None:
-            # --- !!! 區分處理 Series (單行) 和 DataFrame (多行) !!! ---
-            if isinstance(top_candidate_selection, pd.Series):
-                # --- Handle Single Row (Series) Case ---
-                row = top_candidate_selection
-                # Embedding for this single path is top_path_embs (shape [1, hdim] or [hdim])
-                # Ensure we get the single embedding tensor correctly
-                single_path_emb = top_path_embs[0] if top_path_embs.shape[0] == 1 else top_path_embs
-
-                try:
-                    new_src = row['Tgt']
-                    edge_label = row['Edge']
-                    src_label = row['Src']
-
-                    # Construct path string
-                    path_str_prefix = prev_visited_paths_str.get(src_label, src_label) if prev_visited_paths_str else src_label
-                    p = f"{path_str_prefix} --> {edge_label} --> {new_src}"
-                    visited_paths_next_hop[new_src] = p
-                    # No need to store embedding state for next hop
-
-                except KeyError as e:
-                    print(f"\n!!! KeyError processing single row Series !!!")
-                    print(f"Content of Series 'row':\n{row}")
-                    print(f"Error message: Missing key {e}")
-                    # Decide how to handle, maybe stop? raise e
-                except Exception as e:
-                    print(f"\n!!! Unexpected Error processing single row Series !!!")
-                    print(f"Error message: {e}")
-                    # raise e
-
-            elif isinstance(top_candidate_selection, pd.DataFrame):
-                # --- Handle Multiple Rows (DataFrame) Case ---
-                top_candidate_df = top_candidate_selection # Rename for clarity
-                # Iterate using positional index (0 to current_top_n - 1)
-                for positional_idx in range(len(top_candidate_df)):
-                    try:
-                        row = top_candidate_df.iloc[positional_idx] # Get row Series by position
-
-                        new_src = row['Tgt']
-                        edge_label = row['Edge']
-                        src_label = row['Src']
-
-                        # Construct path string
-                        path_str_prefix = prev_visited_paths_str.get(src_label, src_label) if prev_visited_paths_str else src_label
-                        p = f"{path_str_prefix} --> {edge_label} --> {new_src}"
-                        visited_paths_next_hop[new_src] = p
-                        # No need to store embedding state for next hop
-
-                    except KeyError as e:
-                       print(f"\n!!! KeyError caught inside loop !!!")
-                       print(f"Positional Index where error occurred: {positional_idx}")
-                       print(f"Content of 'row':\n{row}")
-                       print(f"Error message: Missing key {e}")
-                       raise e
-                    except Exception as e:
-                       print(f"\n!!! Unexpected Error caught inside loop !!!")
-                       print(f"Positional Index where error occurred: {positional_idx}")
-                       print(f"Error message: {e}")
-                       raise e
-            else:
-                 # This case should ideally not happen if candidate_paths_df is valid
-                 print(f"Warning: top_candidate_selection is neither Series nor DataFrame. Type: {type(top_candidate_selection)}")
-            # --- 結束區分處理 ---
-        else: # top_path_embs is None
-            print("Warning: Cannot determine next hop info as top_path_embs is None.")
-
-        # Return values needed by Trainer:
-        # Note: candidate_paths_df here refers to the *original* one for this hop, used for loss calc
-        return final_scores, visited_paths_next_hop, candidate_paths_df, visited_path_embs_tensor, stop_flag
 
 class Trainer(nn.Module):
     def __init__(self, tokenizer,
                  encoder, # Base encoder like SapBERT
-                 g, # NetworkX graph
-                 cui_embedding, # Initialized CuiEmbedding object
-                 hdim, # Hidden dimension (e.g., 768 for SapBERT)
-                 nums_of_head, # Heads for original PathRanker (MultiheadAttention version) - may not be used by TriAttn
-                 # all_edge_mappings, # Dict mapping edge labels to indices (for EdgeOneHot)
-                 cui_vocab, # Dict mapping CUIs to vocab indices
-                 # nums_of_hops, # Replaced by self.k = 2
-                 top_n, # Top N paths to select per hop
+                 g_nx, # NetworkX graph FOR GraphModel's preprocessing
+                 cui_embedding_lookup, # Initialized CuiEmbedding object (string lookup)
+                 hdim,
+                 nums_of_head, # For original PathRanker, may not be used by TriAttn
+                 cui_vocab_str_to_idx, # IMPORTANT: CUI string to GLOBAL CUI INDEX mapping
+                 top_n,
                  device,
                  nums_of_epochs,
                  LR,
-                 cui_weights=None, # Dict mapping CUIs to weights
+                 cui_weights_dict=None, # Dict: CUI_str -> weight
                  contrastive_learning=True,
                  save_model_path=None,
-                 # save_cui_embedding_path=None, # CuiEmbedding object passed in, maybe save externally
-                 gnn_update=True, # Flag to enable/disable GIN updates within GraphModel
-                 cui_flag=True, # Flag for original PathRanker - may not be used by TriAttn
+                 gnn_update=True,
                  intermediate=False, # Calculate loss on intermediate hops?
-                 distance_metric="Cosine", # For triplet loss
-                 path_encoder_type="MLP", # Or "Transformer"
-                 path_ranker_type="Flat", # Or "Combo" (For TriAttn versions)
-                 gnn_type="Stack", # Or "Single"
-                 prune_thsh=0.8, # Threshold used in original prune_paths util
-                 triplet_margin=1.0, # Margin for triplet loss
-                 early_stopping_patience=3,    # 默認容忍3個epoch
-                 early_stopping_metric='val_loss', # 監控驗證損失
-                 early_stopping_delta=0.001    # 至少要有這麼多改善才算
-                 ): 
+                 distance_metric="Cosine",
+                 path_encoder_type="MLP",
+                 path_ranker_type="Flat",
+                 gnn_type="Stack",
+                 gin_hidden_dim=None, # Pass to GraphModel
+                 gin_num_layers=1,    # Pass to GraphModel
+                 input_edge_dim_for_gin=108, # Pass to GraphModel
+                 triplet_margin=1.0,
+                 early_stopping_patience=3,
+                 early_stopping_metric='val_loss',
+                 early_stopping_delta=0.001
+                 ):
         super(Trainer, self).__init__()
 
         self.tokenizer = tokenizer
-        self.encoder = encoder # The base SapBERT model
-        # self.CUI_encoder = cui_embedding # This is passed to GraphModel
-        self.k = 2 # Max hops fixed at 2
-        self.gmodel = GraphModel(g=g, 
-                                 cui_embedding=cui_embedding,
-                                 hdim=hdim,
-                                 nums_of_head=nums_of_head,
-                                 # edges_dicts removed
-                                 nums_of_hops=self.k, # Pass self.k
-                                 top_n=top_n,
-                                 device=device,
-                                 cui_weights=cui_weights,
-                                 gnn_update=gnn_update,
-                                 cui_flag=cui_flag,
-                                 path_encoder_type=path_encoder_type,
-                                 path_ranker_type=path_ranker_type,
-                                 gnn_type=gnn_type,
-                                 prune_thsh=prune_thsh)
-
-        # Ensure models are on the correct device BEFORE optimizer creation
-        self.encoder.to(device)
-        self.gmodel.to(device)
-
+        self.encoder = encoder
+        self.k_hops = 2 # Max hops fixed at 2
         self.device = device
+        self.cui_vocab_str_to_idx = cui_vocab_str_to_idx # Store this mapping
+        self.rev_cui_vocab_idx_to_str = {v: k for k, v in cui_vocab_str_to_idx.items()}
+
+
+        self.gmodel = GraphModel(
+            g_nx=g_nx, # Pass the NetworkX graph
+            cui_embedding_lookup=cui_embedding_lookup,
+            hdim=hdim,
+            nums_of_head=nums_of_head,
+            num_hops=self.k_hops,
+            top_n=top_n,
+            device=device,
+            cui_weights_dict=cui_weights_dict,
+            gnn_update=gnn_update,
+            path_encoder_type=path_encoder_type,
+            path_ranker_type=path_ranker_type,
+            gnn_type=gnn_type,
+            gin_hidden_dim=gin_hidden_dim,
+            gin_num_layers=gin_num_layers,
+            input_edge_dim_for_gin=input_edge_dim_for_gin
+        )
+
+        self.encoder.to(device)
+        self.gmodel.to(device) # GraphModel's __init__ should also move its submodules
+
         self.LR = LR
         self.adam_epsilon = 1e-8
-        self.weight_decay = 1e-4 # Example value, adjust as needed
+        self.weight_decay = 1e-4
         self.nums_of_epochs = nums_of_epochs
         self.intermediate = intermediate
-        self.print_step = 50 # Print progress every N steps
+        self.print_step = 50
         self.distance_metric = distance_metric
-        # self.prune_thsh = prune_thsh # Already passed to GraphModel
-        self.mode = 'train' # Default mode
+        self.mode = 'train'
         self.contrastive_learning = contrastive_learning
         self.triplet_margin = triplet_margin
 
-        self.g = g # Keep graph reference if needed directly in Trainer
         self.loss_fn_bce = nn.BCEWithLogitsLoss()
-        self.cui_vocab = cui_vocab # Needed for loss calculation against GT CUIs
-        self.rev_cui_vocab = {v: k for k, v in self.cui_vocab.items()} # For converting vocab indices back to CUIs
-
         self.save_model_path = save_model_path
-        # self.save_cui_embedding_path = save_cui_embedding_path # Handle CUI embedding saving outside if needed
 
         self.early_stopping_patience = early_stopping_patience
-        self.early_stopping_metric = early_stopping_metric.lower() # val_loss or val_acc
+        self.early_stopping_metric = early_stopping_metric.lower()
         self.early_stopping_delta = early_stopping_delta
         self.epochs_no_improve = 0
         self.early_stop = False
         if self.early_stopping_metric == 'val_loss':
-            self.best_metric_val = float('inf') # For loss, lower is better
+            self.best_metric_val = float('inf')
         elif self.early_stopping_metric == 'val_acc':
-            self.best_metric_val = float('-inf') # For accuracy, higher is better
+            self.best_metric_val = float('-inf')
         else:
             raise ValueError("early_stopping_metric 必須是 'val_loss' 或 'val_acc'")
-        
 
-        print("**** ============= **** ")
-        exp_setting = f"TRAINER SETUP (MediQ Adapted): MAX HOPS: {self.k} | TOP N: {top_n} | INTERMEDIATE LOSS: {self.intermediate} | LR: {LR} | GNN UPDATE: {gnn_update} | CONTRASTIVE: {self.contrastive_learning} | PATH ENC: {path_encoder_type} | PATH RANKER: TriAttn {path_ranker_type} | GNN TYPE: {gnn_type}"
-        print(exp_setting)
-        if logging.getLogger().hasHandlers():
-             logging.info(exp_setting)
-        print("**** ============= **** ")
-
-        self.optimizer = None # Initialize optimizer later
+        print("**** ============= TRAINER (MediQ Tensorized GModel) ============= **** ")
+        # ... (exp_setting logging) ...
+        self.optimizer = None
 
     def create_optimizers(self):
-        """Creates AdamW optimizer for trainable parameters."""
+                
         no_decay = ["bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
-            {'params': [p for n, p in self.encoder.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': self.weight_decay},
-            {'params': [p for n, p in self.encoder.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
-            {'params': [p for n, p in self.gmodel.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': self.weight_decay},
-            {'params': [p for n, p in self.gmodel.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+            {'params': [p for n, p in self.encoder.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad], 'weight_decay': self.weight_decay},
+            {'params': [p for n, p in self.encoder.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad], 'weight_decay': 0.0},
+            {'params': [p for n, p in self.gmodel.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad], 'weight_decay': self.weight_decay},
+            {'params': [p for n, p in self.gmodel.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad], 'weight_decay': 0.0}
         ]
-        # Use a single LR for now, original code had possibility of list but wasn't fully implemented
         effective_lr = self.LR[0] if isinstance(self.LR, list) else self.LR
         print(f"Using Learning Rate: {effective_lr}")
         self.optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=effective_lr, eps=self.adam_epsilon)
         print("Optimizer created.")
 
-    def compute_context_embedding(self, known_cuis_list):
-        """
-        Computes the context embedding (h_con) from a list of known CUIs.
-        Strategy: Average the embeddings of unique known CUIs.
-        Args:
-            known_cuis_list (list): List of CUI strings for one sample.
-        Returns:
-            torch.Tensor: Context embedding tensor (1 x hdim) or None if no valid CUIs.
-        """
-        if not known_cuis_list:
-            # Return a zero tensor or handle appropriately
-            # Returning None might be safer to indicate missing context
-            return None
-            # Or return torch.zeros(1, 768).to(self.device) # Assuming hdim=768
 
-        # Ensure CUIs are valid and get embeddings
+    def compute_context_embedding(self, known_cuis_str_list_sample):
+        # (As defined before, ensure it uses self.gmodel.n_encoder_lookup)
+        # ...
+        if not known_cuis_str_list_sample: return None
         valid_embeddings = []
-        unique_known_cuis = list(set(known_cuis_list)) # Process unique CUIs
-        for cui in unique_known_cuis:
-            # Check if CUI exists in the embedding data (handle potential KeyError)
-            if cui in self.gmodel.n_encoder.data:
-                 # Assuming encode returns shape [1, hdim] or [hdim]
-                 emb = self.gmodel.n_encoder.encode([cui]).to(self.device) # Ensure it's on device
-                 valid_embeddings.append(emb.squeeze(0)) # Squeeze potential batch dim
-            # else:
-            #     print(f"Warning: CUI {cui} not found in embedding data.")
+        unique_known_cuis = list(set(known_cuis_str_list_sample))
+        for cui_str in unique_known_cuis:
+            # Assuming n_encoder_lookup is the CuiEmbedding object from GraphModel
+            if cui_str in self.gmodel.n_encoder_lookup.data: # Check if CUI exists
+                 emb = self.gmodel.n_encoder_lookup.encode([cui_str]).to(self.device)
+                 valid_embeddings.append(emb.squeeze(0))
+        if not valid_embeddings: return None
+        return torch.mean(torch.stack(valid_embeddings), dim=0, keepdim=True)
 
-        if not valid_embeddings:
-            # Return None if no known CUIs had embeddings
-             return None
-             # Or return torch.zeros(1, 768).to(self.device)
 
-        # Aggregate embeddings (e.g., mean pooling)
-        h_con = torch.mean(torch.stack(valid_embeddings), dim=0, keepdim=True) # Shape [1, hdim]
-        return h_con
+    def _get_gt_indices_tensor(self, gt_cuis_str_list):
+        """Converts a list of GT CUI strings to a tensor of global CUI indices."""
+        if not gt_cuis_str_list:
+            return torch.tensor([], dtype=torch.long, device=self.device)
+        gt_indices = [self.cui_vocab_str_to_idx[c_str] for c_str in gt_cuis_str_list if c_str in self.cui_vocab_str_to_idx]
+        return torch.tensor(gt_indices, dtype=torch.long, device=self.device)
 
-    def compute_bce_loss_for_hop(self, final_scores, candidate_paths_df, gt_cuis):
-        """
-        Calculates BCE loss for a given hop based on path scores.
-        Aggregates scores for each target CUI and compares against GT.
-        Args:
-            final_scores (torch.Tensor): Tensor of scores for each path in candidate_paths_df.
-            candidate_paths_df (pd.DataFrame): DataFrame with ['Src', 'Tgt', 'Edge'] for scored paths.
-            gt_cuis (list): List of ground truth CUI strings for this hop.
-        Returns:
-            torch.Tensor: Calculated BCE loss for this hop.
-        """
-        hop_loss = torch.tensor(0.0).to(self.device)
-        if final_scores is None or final_scores.numel() == 0 or not gt_cuis:
-            return hop_loss # Return 0 loss if no scores or no GT
+    def compute_bce_loss_for_hop(self, all_paths_info_hop, gt_cuis_str_list_sample):
+        hop_loss = torch.tensor(0.0, device=self.device)
+        if all_paths_info_hop is None or all_paths_info_hop['scores'] is None or \
+           all_paths_info_hop['scores'].numel() == 0 or not gt_cuis_str_list_sample:
+            return hop_loss
 
-        # Map target CUIs from paths to scores
-        target_cui_scores = defaultdict(list)
-        if 'Tgt' not in candidate_paths_df.columns:
-             print("Warning: 'Tgt' column missing in candidate_paths_df for BCE loss.")
-             return hop_loss
+        path_scores = all_paths_info_hop['scores'].squeeze(-1) # [num_paths_this_hop]
+        path_target_global_indices = all_paths_info_hop['tgt_idx'] # [num_paths_this_hop] (GLOBAL CUI INDICES)
+        
+        gt_global_indices_set = set(self._get_gt_indices_tensor(gt_cuis_str_list_sample).tolist())
+        if not gt_global_indices_set: # No valid GT CUIs for this sample/hop
+            return hop_loss
 
-        for i, score in enumerate(final_scores):
-            target_cui = candidate_paths_df.iloc[i]['Tgt']
-            target_cui_scores[target_cui].append(score)
+        # Aggregate scores for each unique target CUI index found in paths
+        unique_path_targets_global_indices, inverse_indices = torch.unique(path_target_global_indices, return_inverse=True)
+        
+        # Use scatter_max to get the max score for each unique target CUI index
+        # If torch_scatter not available, use a loop or other PyTorch methods
+        if TORCH_SCATTER_AVAILABLE:
+            # aggregated_scores_for_unique_targets = scatter_max(path_scores, inverse_indices, dim=0, dim_size=unique_path_targets_global_indices.size(0))[0]
+             # scatter_max returns (values, argmax_indices). We only need values.
+             # Fallback if scatter_max is not directly available or has issues with PyTorch versions
+            temp_aggregated_scores = torch.full((unique_path_targets_global_indices.size(0),), float('-inf'), device=self.device, dtype=path_scores.dtype)
+            for i, unique_tgt_idx in enumerate(unique_path_targets_global_indices):
+                mask = (path_target_global_indices == unique_tgt_idx)
+                if torch.any(mask):
+                    temp_aggregated_scores[i] = torch.max(path_scores[mask])
+            aggregated_scores_for_unique_targets = temp_aggregated_scores
 
-        if not target_cui_scores:
-             return hop_loss
+        else: # Fallback without torch_scatter
+            # print("BCE Fallback: Looped aggregation for scores.")
+            aggregated_scores_for_unique_targets_list = []
+            for unique_tgt_idx in unique_path_targets_global_indices.tolist():
+                mask = (path_target_global_indices == unique_tgt_idx)
+                if torch.any(mask):
+                    aggregated_scores_for_unique_targets_list.append(torch.max(path_scores[mask]))
+                # else: handle case where unique_tgt_idx somehow has no scores (should not happen)
+            if not aggregated_scores_for_unique_targets_list: return hop_loss
+            aggregated_scores_for_unique_targets = torch.stack(aggregated_scores_for_unique_targets_list)
 
-        # Aggregate scores (e.g., max pooling) and calculate loss
-        unique_target_cuis_in_paths = list(target_cui_scores.keys())
-        gt_cuis_set = set(gt_cuis)
-
-        aggregated_scores = []
-        labels = []
-
-        # Consider all unique target CUIs found in the paths for this hop
-        for cui in unique_target_cuis_in_paths:
-            # Aggregate scores for this CUI (e.g., max)
-            max_score = torch.max(torch.stack(target_cui_scores[cui]))
-            aggregated_scores.append(max_score)
-            # Create label (1 if CUI is in GT, 0 otherwise)
-            labels.append(1.0 if cui in gt_cuis_set else 0.0)
-
-        if not aggregated_scores:
-             return hop_loss
-
-        # Calculate BCE loss
-        scores_tensor = torch.stack(aggregated_scores).to(self.device)
-        labels_tensor = torch.tensor(labels).to(self.device)
-        hop_loss = self.loss_fn_bce(scores_tensor, labels_tensor)
-
-        # print(f"Debug BCE: scores={scores_tensor.detach().cpu().numpy()}, labels={labels_tensor.cpu().numpy()}, loss={hop_loss.item()}")
-
+        labels_for_unique_targets = torch.tensor(
+            [1.0 if idx.item() in gt_global_indices_set else 0.0 for idx in unique_path_targets_global_indices],
+            device=self.device
+        )
+        
+        if aggregated_scores_for_unique_targets.numel() > 0 :
+             hop_loss = self.loss_fn_bce(aggregated_scores_for_unique_targets, labels_for_unique_targets)
         return hop_loss
 
-    def compute_triplet_loss_for_hop(self, anchor_embedding, visited_path_embs, candidate_paths_df, gt_cuis):
-        """
-        Calculates Triplet loss for a given hop.
-        Args:
-            anchor_embedding (torch.Tensor): Anchor embedding (e.g., from h_text, h_con). Shape [1, hdim].
-            visited_path_embs (torch.Tensor): Embeddings of the dynamically generated paths for this hop. Shape [num_paths, hdim].
-            candidate_paths_df (pd.DataFrame): DataFrame mapping paths to target CUIs.
-            gt_cuis (list): List of ground truth CUI strings for this hop.
-        Returns:
-            torch.Tensor: Calculated Triplet loss for this hop.
-        """
-        triplet_loss = torch.tensor(0.0).to(self.device)
-        if anchor_embedding is None or visited_path_embs is None or visited_path_embs.numel() == 0 or not gt_cuis:
+
+    def compute_triplet_loss_for_hop(self, anchor_embedding, all_paths_info_hop, gt_cuis_str_list_sample):
+        triplet_loss = torch.tensor(0.0, device=self.device)
+        if anchor_embedding is None or all_paths_info_hop is None or \
+           all_paths_info_hop['encoded_embeddings'] is None or \
+           all_paths_info_hop['encoded_embeddings'].numel() == 0 or not gt_cuis_str_list_sample:
             return triplet_loss
 
-        gt_cuis_set = set(gt_cuis)
-        positive_path_indices = []
-        negative_path_indices = []
+        path_embeddings = all_paths_info_hop['encoded_embeddings'] # [num_paths, hdim]
+        path_target_global_indices = all_paths_info_hop['tgt_idx']   # [num_paths] (GLOBAL CUI INDICES)
 
-        if 'Tgt' not in candidate_paths_df.columns:
-            print("Warning: 'Tgt' column missing in candidate_paths_df for Triplet loss.")
-            return triplet_loss
+        gt_global_indices_set = set(self._get_gt_indices_tensor(gt_cuis_str_list_sample).tolist())
+        if not gt_global_indices_set: return triplet_loss
+        
+        positive_indices_mask = torch.tensor(
+            [idx.item() in gt_global_indices_set for idx in path_target_global_indices],
+            dtype=torch.bool, device=self.device
+        )
+        negative_indices_mask = ~positive_indices_mask
 
-        for i in range(len(candidate_paths_df)):
-            target_cui = candidate_paths_df.iloc[i]['Tgt']
-            if target_cui in gt_cuis_set:
-                positive_path_indices.append(i)
-            else:
-                negative_path_indices.append(i)
+        positive_embs = path_embeddings[positive_indices_mask]
+        negative_embs = path_embeddings[negative_indices_mask]
 
-        # Only compute loss if we have at least one positive and one negative
-        if not positive_path_indices or not negative_path_indices:
-            return triplet_loss
+        if positive_embs.numel() == 0 or negative_embs.numel() == 0:
+            return triplet_loss # Need at least one positive and one negative
 
-        # Simple Triplet Loss: Compare each positive to all negatives (or a sample)
-        # More sophisticated sampling might be needed for large numbers of negatives
-        num_positives = len(positive_path_indices)
-        num_negatives = len(negative_path_indices)
+        # Simplified Triplet: Anchor vs Random Positive vs Random Negative
+        # For more robust triplet loss, you might sample multiple triplets
+        # Or use strategies like semi-hard negative mining.
+        
+        # Select one random positive and one random negative for each anchor
+        # Here, anchor is single [1, hdim].
+        # We can compare anchor to all positives and all negatives.
+        num_pos = positive_embs.size(0)
+        num_neg = negative_embs.size(0)
 
-        # Expand anchor for broadcasting
-        anchor_expanded = anchor_embedding.expand(num_positives * num_negatives, -1)
+        anchor_expanded_pos = anchor_embedding.expand(num_pos, -1)
+        anchor_expanded_neg = anchor_embedding.expand(num_neg, -1)
 
-        # Get positive and negative embeddings
-        positive_embs = visited_path_embs[positive_path_indices] # Shape [num_pos, hdim]
-        negative_embs = visited_path_embs[negative_path_indices] # Shape [num_neg, hdim]
-
-        # Repeat positive and negative embeddings to form all pairs
-        # shape: [num_pos * num_neg, hdim]
-        positive_embs_repeated = positive_embs.repeat_interleave(num_negatives, dim=0)
-        # shape: [num_pos * num_neg, hdim]
-        negative_embs_repeated = negative_embs.repeat(num_positives, 1)
-
-        # Calculate distances (using Cosine Similarity or Pairwise Distance)
         if self.distance_metric == "Cosine":
-            # Maximize similarity for positives, minimize for negatives
-            # Loss = max(0, margin - cos(anchor, pos) + cos(anchor, neg))
-            sim_pos = F.cosine_similarity(anchor_expanded, positive_embs_repeated)
-            sim_neg = F.cosine_similarity(anchor_expanded, negative_embs_repeated)
-            losses = F.relu(self.triplet_margin - sim_pos + sim_neg)
+            # We want sim(anchor, pos) to be high, sim(anchor, neg) to be low
+            # Loss = margin - (sim_pos_avg - sim_neg_avg)  OR
+            # Loss for each pos, neg pair: margin - sim(A,P) + sim(A,N)
+            # Let's take average similarity for simplicity here
+            sim_pos_all = F.cosine_similarity(anchor_expanded_pos, positive_embs) # [num_pos]
+            sim_neg_all = F.cosine_similarity(anchor_expanded_neg, negative_embs) # [num_neg]
+            
+            # Simplest: average positive similarity vs average negative similarity
+            avg_sim_pos = torch.mean(sim_pos_all) if sim_pos_all.numel() > 0 else torch.tensor(0.0, device=self.device)
+            avg_sim_neg = torch.mean(sim_neg_all) if sim_neg_all.numel() > 0 else torch.tensor(0.0, device=self.device)
+            
+            loss_val = self.triplet_margin - avg_sim_pos + avg_sim_neg
+
         else: # Euclidean distance
-            # Minimize distance for positives, maximize for negatives
-            # Loss = max(0, margin + dist(anchor, pos) - dist(anchor, neg))
-            dist_pos = F.pairwise_distance(anchor_expanded, positive_embs_repeated, p=2)
-            dist_neg = F.pairwise_distance(anchor_expanded, negative_embs_repeated, p=2)
-            losses = F.relu(self.triplet_margin + dist_pos - dist_neg)
+            # We want dist(anchor, pos) to be low, dist(anchor, neg) to be high
+            # Loss = margin + dist_pos_avg - dist_neg_avg
+            dist_pos_all = F.pairwise_distance(anchor_expanded_pos, positive_embs, p=2)
+            dist_neg_all = F.pairwise_distance(anchor_expanded_neg, negative_embs, p=2)
 
-        triplet_loss = losses.mean()
-        # print(f"Debug Triplet: pos_indices={len(positive_path_indices)}, neg_indices={len(negative_path_indices)}, loss={triplet_loss.item()}")
+            avg_dist_pos = torch.mean(dist_pos_all) if dist_pos_all.numel() > 0 else torch.tensor(0.0, device=self.device)
+            avg_dist_neg = torch.mean(dist_neg_all) if dist_neg_all.numel() > 0 else torch.tensor(0.0, device=self.device)
 
+            loss_val = self.triplet_margin + avg_dist_pos - avg_dist_neg
+            
+        triplet_loss = F.relu(loss_val)
         return triplet_loss
 
 
     def forward_per_batch(self, batch):
-        """
-        Performs forward pass for a batch using the iterative GraphModel.
-        Calculates loss based on hop-specific ground truths.
-        Handles state (current CUIs, path strings) between iterations.
-        """
-        # 1. Unpack Batch & Get Initial Embeddings
         input_text_tks_padded = batch['input_text_tks_padded']
-        known_cuis_batch = batch['known_cuis']
-        hop1_target_cuis_batch = batch['hop1_target_cuis']
-        hop2_target_cuis_batch = batch['hop2_target_cuis']
+        known_cuis_str_batch = batch['known_cuis'] # List of lists of CUI strings
+        hop1_target_cuis_str_batch = batch['hop1_target_cuis']
+        hop2_target_cuis_str_batch = batch['hop2_target_cuis']
 
-        input_task_embs = self.encoder(
+        input_task_embs_batch = self.encoder(
             input_text_tks_padded['input_ids'].to(self.device),
             input_text_tks_padded['attention_mask'].to(self.device)
-        ).pooler_output
+        ).pooler_output # [batch_size, hdim]
 
-        batch_total_loss = torch.tensor(0.0, requires_grad=True).to(self.device) # Ensure initial loss requires grad if accumulated upon
-        batch_size = input_task_embs.shape[0]
-        final_predicted_cuis_batch = [[] for _ in range(batch_size)]
+        accumulated_batch_loss = torch.tensor(0.0, device=self.device)
+        batch_size = input_task_embs_batch.shape[0]
+        final_predicted_cuis_global_idx_batch = [torch.empty(0, dtype=torch.long, device=self.device) for _ in range(batch_size)]
 
-        # 2. Iterate through samples in the batch
+
         for i in range(batch_size):
-            # Initialize state for this sample
-            sample_loss_accumulator = [] # Store loss tensors per hop
-            task_emb = input_task_embs[i].unsqueeze(0)
-            known_cuis_sample = known_cuis_batch[i]
-            hop1_gt = hop1_target_cuis_batch[i]
-            hop2_gt = hop2_target_cuis_batch[i]
+            sample_loss_this_item = torch.tensor(0.0, device=self.device)
+            task_emb_sample = input_task_embs_batch[i].unsqueeze(0) # [1, hdim]
+            known_cuis_str_sample = known_cuis_str_batch[i]
+            
+            context_emb_sample = self.compute_context_embedding(known_cuis_str_sample)
+            if context_emb_sample is None: # Fallback if no known CUIs have embeddings
+                context_emb_sample = task_emb_sample # Use task embedding as context
 
-            context_emb = self.compute_context_embedding(known_cuis_sample)
-            if context_emb is None:
-                context_emb = task_emb # Fallback
+            # Initial state for multi-hop for this sample
+            current_cui_str_list_for_hop = known_cuis_str_sample
+            prev_iter_state_for_next_hop = None # For the first hop
+            
+            # Store selected target CUIs (global indices) after the last successful hop for this sample
+            last_hop_selected_target_cuis_idx = torch.empty(0, dtype=torch.long, device=self.device)
 
-            # Initial state for iteration
-            current_cui_list = known_cuis_sample
-            current_candidate_paths_df = None # Previous hop's df
-            current_visited_paths_str = None # Previous hop's path strings {CUI: path_str}
 
-            # 3. Iterative Reasoning (Max K=2 hops)
-            for running_k in range(self.k): # k = 0, 1
-                if not current_cui_list: # Stop if no nodes to expand from previous hop
+            for running_k in range(self.k_hops): # 0, 1 for k_hops=2
+                if not current_cui_str_list_for_hop and running_k > 0 : # Stop if no nodes to expand from previous hop
                     break
-
-                final_scores, visited_paths_next_hop, candidate_paths_df_this_hop, \
-                visited_path_embs_tensor, stop_flag = self.gmodel.one_iteration(
-                    task_emb=task_emb,
-                    cui_lists=current_cui_list,
-                    running_k=running_k,
-                    context_emb=context_emb,
-                    prev_candidate_paths_df=current_candidate_paths_df, # Pass previous df
-                    prev_visited_paths_str=current_visited_paths_str  # Pass previous path strings
+                
+                all_paths_info_hop, visited_next_hop_str_dict_hop, \
+                next_hop_state_info_hop, stop_flag = self.gmodel.one_iteration(
+                    task_emb_batch=task_emb_sample,
+                    current_cui_str_list=current_cui_str_list_for_hop,
+                    running_k_hop=running_k,
+                    context_emb_batch=context_emb_sample,
+                    prev_iteration_state=prev_iter_state_for_next_hop
                 )
 
-                if stop_flag or final_scores is None or final_scores.numel() == 0:
-                    break # Stop if iteration signals stop or finds nothing
+                if stop_flag or all_paths_info_hop is None:
+                    print(f"  Sample {i}, Hop {running_k}: Stopped or no path info.")
+                    break # Stop iteration for this sample if no paths or error
 
-                # Determine Ground Truth for this hop
-                current_gt_cuis = hop1_gt if running_k == 0 else hop2_gt
+                # Determine Ground Truth CUI strings for this hop
+                gt_cuis_str_list_this_hop = hop1_target_cuis_str_batch[i] if running_k == 0 else hop2_target_cuis_str_batch[i]
 
-                # Calculate Loss for this hop (ensure loss tensors require grad)
-                hop_bce_loss = self.compute_bce_loss_for_hop(final_scores, candidate_paths_df_this_hop, current_gt_cuis)
-                hop_triplet_loss = torch.tensor(0.0).to(self.device)
+                # Calculate Loss for this hop
+                hop_bce_loss = self.compute_bce_loss_for_hop(all_paths_info_hop, gt_cuis_str_list_this_hop)
+                hop_triplet_loss = torch.tensor(0.0, device=self.device)
                 if self.contrastive_learning and self.mode == "train":
-                    anchor_embedding = task_emb * context_emb # Simple anchor example
-                    hop_triplet_loss = self.compute_triplet_loss_for_hop(anchor_embedding, visited_path_embs_tensor, candidate_paths_df_this_hop, current_gt_cuis)
+                    # Construct anchor: e.g., combination of task and context
+                    # For simplicity, let's use task_emb_sample as anchor.
+                    # A better anchor might involve embeddings of the source CUIs of this hop.
+                    anchor_for_triplet = task_emb_sample 
+                    hop_triplet_loss = self.compute_triplet_loss_for_hop(
+                        anchor_for_triplet, all_paths_info_hop, gt_cuis_str_list_this_hop
+                    )
+                
+                current_hop_total_loss = hop_bce_loss + hop_triplet_loss
+                
+                #---debug---
+                print(f"  Sample {i}, Hop {running_k}:")
+                print(f"    Start CUIs: {current_cui_str_list_for_hop[:5] if current_cui_str_list_for_hop else 'None'}")
+                print(f"    GT CUIs: {gt_cuis_str_list_this_hop[:5] if gt_cuis_str_list_this_hop else 'None'}")
+                if all_paths_info_hop:
+                    print(f"    Path Scores numel: {all_paths_info_hop['scores'].numel() if all_paths_info_hop['scores'] is not None else 'None'}")
+                    print(f"    Path Tgt Idx numel: {all_paths_info_hop['tgt_idx'].numel() if all_paths_info_hop['tgt_idx'] is not None else 'None'}")
+                else:
+                    print(f"    all_paths_info_hop is None.")
+                print(f"    BCE Loss: {hop_bce_loss.item():.4f}, Triplet Loss: {hop_triplet_loss.item():.4f}")
+                print(f"    Hop Total Loss: {current_hop_total_loss.item():.4f}, Requires Grad: {current_hop_total_loss.requires_grad}, Grad Fn: {current_hop_total_loss.grad_fn}")
+                #---debug---
+                
+                
 
-                # Store loss tensor for accumulation
                 if running_k == 0 and self.intermediate:
-                    sample_loss_accumulator.append(hop_bce_loss + hop_triplet_loss)
-                if running_k == self.k - 1: # Always include final hop loss
-                    sample_loss_accumulator.append(hop_bce_loss + hop_triplet_loss)
-
-
+                    sample_loss_this_item = sample_loss_this_item + current_hop_total_loss
+                if running_k == self.k_hops - 1: # Always include final hop loss
+                    sample_loss_this_item = sample_loss_this_item + current_hop_total_loss
+                
                 # Update state for the next iteration
-                current_cui_list = list(visited_paths_next_hop.keys())
-                current_candidate_paths_df = candidate_paths_df_this_hop # Store for next iteration's retrieve_neighbors...
-                current_visited_paths_str = visited_paths_next_hop # Store path strings for next iteration
+                if next_hop_state_info_hop and next_hop_state_info_hop['selected_hop_target_idx'] is not None:
+                    last_hop_selected_target_cuis_idx = next_hop_state_info_hop['selected_hop_target_idx']
+                    current_cui_str_list_for_hop = [
+                        self.rev_cui_vocab_idx_to_str.get(idx.item()) 
+                        for idx in last_hop_selected_target_cuis_idx
+                        if self.rev_cui_vocab_idx_to_str.get(idx.item()) is not None # Filter out Nones
+                    ]
+                    prev_iter_state_for_next_hop = next_hop_state_info_hop 
+                else: # No valid targets selected for next hop
+                    break 
+            
+            accumulated_batch_loss = accumulated_batch_loss + sample_loss_this_item
+            final_predicted_cuis_global_idx_batch[i] = last_hop_selected_target_cuis_idx
 
 
-            # Store final predicted CUIs
-            final_predicted_cuis_batch[i] = current_cui_list # CUIs selected after the last successful hop
+        avg_batch_loss = accumulated_batch_loss / batch_size if batch_size > 0 else torch.tensor(0.0, device=self.device)
+        
+        # Convert final predicted global indices back to CUI strings for measure_accuracy
+        final_predicted_cuis_str_batch = []
+        for idx_tensor in final_predicted_cuis_global_idx_batch:
+            final_predicted_cuis_str_batch.append(
+                [self.rev_cui_vocab_idx_to_str.get(idx.item()) for idx in idx_tensor 
+                 if self.rev_cui_vocab_idx_to_str.get(idx.item()) is not None]
+            )
+            
+        return avg_batch_loss, final_predicted_cuis_str_batch # Return CUI strings for accuracy
 
-            # Sum losses for the sample
-            if sample_loss_accumulator:
-                 batch_total_loss = batch_total_loss + torch.sum(torch.stack(sample_loss_accumulator))
 
-
-        # 4. Return Average Batch Loss and Predictions
-        avg_batch_loss = batch_total_loss / batch_size if batch_size > 0 else torch.tensor(0.0).to(self.device)
-        final_predicted_cuis_batch_detached = [[cui for cui in sample_preds] for sample_preds in final_predicted_cuis_batch]
-        return avg_batch_loss, final_predicted_cuis_batch_detached
-
-
-    def measure_accuracy(self, final_predicted_cuis_batch, target_cuis_batch, mode="Recall@N"):
-        """
-        Measures accuracy based on comparing final predicted CUIs with hop-2 GT CUIs.
-        Args:
-            final_predicted_cuis_batch (list[list[str]]): List of predicted CUI lists for the batch.
-            target_cuis_batch (list[list[str]]): List of hop-2 ground truth CUI lists.
-            mode (str): Calculation mode ("Precision@N", "Recall@N", "F1@N"). N is determined by len(pred).
-        Returns:
-            float: Average accuracy score for the batch.
-        """
-        batch_size = len(target_cuis_batch)
-        if batch_size == 0:
-            return 0.0
-
+    def measure_accuracy(self, final_predicted_cuis_str_batch, target_cuis_str_batch, mode="Recall@N"):
+        # (measure_accuracy logic using string lists, as defined before)
+        # ...
+        batch_size = len(target_cuis_str_batch)
+        if batch_size == 0: return 0.0
         accs = []
         for i in range(batch_size):
-            gold_cuis = set(target_cuis_batch[i])
-            pred_cuis = set(final_predicted_cuis_batch[i])
+            gold_cuis = set(target_cuis_str_batch[i])
+            pred_cuis = set(final_predicted_cuis_str_batch[i]) # Already list of strings
             num_pred = len(pred_cuis)
             num_gold = len(gold_cuis)
             num_intersect = len(gold_cuis.intersection(pred_cuis))
@@ -1492,284 +1688,308 @@ class Trainer(nn.Module):
             precision = num_intersect / num_pred if num_pred > 0 else 0.0
             recall = num_intersect / num_gold if num_gold > 0 else 0.0
             f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-
-            if mode == "Precision@N":
-                acc = precision
-            elif mode == "Recall@N":
-                acc = recall
-            elif mode == "F1@N":
-                 acc = f1
-            else: # Default to Recall
-                acc = recall
-
+            
+            # Defaulting to recall for this setup, adjust 'mode' as needed
+            acc = recall 
             accs.append(acc)
+        return np.mean(accs) if accs else 0.0
 
-        return np.mean(accs)
 
-
-    def train(self, train_data, dev_data, lr_scheduler=None):
-        """Main training loop with early stopping."""
-        if self.optimizer is None:
-            self.create_optimizers()
-
-        # min_dev_loss = float('inf') # 由 self.best_metric_val 取代
-        update_step = 4 # Gradient accumulation steps
+    def train(self, train_data_loader, dev_data_loader, lr_scheduler=None):
+        # (Training loop logic, as defined before, calling self.forward_per_batch)
+        # Ensure self.encoder and self.gmodel are set to train() mode at start of epoch
+        # and eval() mode for validation.
+        # ...
+        if self.optimizer is None: self.create_optimizers()
+        update_step = 4 
 
         for ep in range(self.nums_of_epochs):
             print(f"\n--- Starting Epoch {ep+1}/{self.nums_of_epochs} ---")
             self.mode = 'train'
             self.encoder.train()
             self.gmodel.train()
-            epoch_loss_train = []
-            epoch_acc_train = []
-            batch_count = 0
-            accumulated_loss = 0.0
-            train_pbar = tqdm(train_data, desc=f"Epoch {ep+1} Training")
+            epoch_loss_train_list = [] # Store individual batch losses
+            epoch_acc_train_list = []
+            
+            # For gradient accumulation
+            accumulated_loss_for_step = torch.tensor(0.0, device=self.device)
+            
+            train_pbar = tqdm(train_data_loader, desc=f"Epoch {ep+1} Training")
+            batch_idx_in_epoch = 0
 
             for batch in train_pbar:
-                if batch is None: continue
-                batch_loss, final_predictions = self.forward_per_batch(batch)
-                target_cuis_batch = batch['hop2_target_cuis']
-                batch_acc = self.measure_accuracy(final_predictions, target_cuis_batch, mode="Recall@N")
+                if batch is None: continue # From collate_fn
 
-                batch_loss_normalized = batch_loss / update_step
-                # accumulated_loss += batch_loss_normalized.item() # 應該在 step 後記錄
+                # forward_per_batch returns average loss for that batch
+                batch_avg_loss, final_predictions_str = self.forward_per_batch(batch)
                 
-                if torch.isnan(batch_loss_normalized) or torch.isinf(batch_loss_normalized):
-                    print(f"警告: Epoch {ep+1}, Batch {batch_count+1}, 檢測到 NaN 或 Inf 損失，跳過反向傳播。損失值: {batch_loss_normalized.item()}")
-                    # 選擇是否需要清零梯度，以防之前的梯度影響下一次有效的 step
-                    if (batch_count + 1) % update_step == 0: # 如果剛好在 step 的邊界
-                        self.optimizer.zero_grad() # 清零，因為這次 step 不會執行
-                    accumulated_loss = 0.0 # 重置，因為這次 step 不會執行
-                    batch_count += 1
-                    continue # 跳過當前的 backward 和 step
+                # Debug Start
+                
+                if not batch_avg_loss.requires_grad:
+                    print(f"----------- ALERT: Epoch {ep+1}, Batch {batch_idx_in_epoch+1} -----------")
+                    print(f"batch_avg_loss: {batch_avg_loss.item()}, requires_grad: {batch_avg_loss.requires_grad}, grad_fn: {batch_avg_loss.grad_fn}")
+                    print("This batch resulted in a loss that does not require gradients.")
+                    print("This usually means no valid paths/targets led to a parameter-dependent loss calculation for ANY sample in this batch.")
+                    
+                    # 在這種情況下，調用 .backward() 會出錯。
+                    # 我們可以選擇跳過這個 micro-batch 的梯度更新。
+                    # 仍然需要處理梯度累積的計數器 batch_idx_in_epoch % update_step
+                    if (batch_idx_in_epoch + 1) % update_step == 0:
+                        # 如果剛好是更新步驟，但這個 micro-batch (或之前累積的) 沒有梯度
+                        # 我們可能仍然需要 zero_grad() 來清除任何可能的舊梯度（儘管理論上不應該有）
+                        # 並且不執行 optimizer.step() 如果沒有有效的梯度累積。
+                        # 一個簡單的處理是，如果整個 update_step 週期內的 loss 都是 non-grad，則不 step。
+                        # 但目前的梯度累積是每個 micro-batch 都 .backward()。
+                        # 所以，如果 loss_to_accumulate 不 require_grad，就不 backward。
+                        print("Skipping backward pass for this micro-batch as loss does not require grad.")
+                        # accumulated_loss_for_step 應該不會被這個 non-grad loss 影響，因為我們只加 loss.item()
+                    # else: # 不是 optimizer step 的邊界，繼續累積（雖然這個 batch 貢獻的梯度為0）
+                    #     pass
 
-                batch_loss_normalized.backward()
-                accumulated_loss += batch_loss_normalized.item() # 在 backward 後記錄
-                batch_count += 1
+                
+                
+                
+                
+                # Debug End
+                
+                # For accuracy, use hop2_target_cuis (final hop GT)
+                target_cuis_str_for_acc = batch['hop2_target_cuis']
+                batch_acc = self.measure_accuracy(final_predictions_str, target_cuis_str_for_acc)
 
-                if batch_count % update_step == 0:
+                if torch.isnan(batch_avg_loss) or torch.isinf(batch_avg_loss):
+                    print(f"Warning: NaN/Inf loss detected at Epoch {ep+1}, Batch {batch_idx_in_epoch+1}. Skipping step.")
+                    # Important: if skipping, zero out any accumulated grad for THIS batch
+                    self.optimizer.zero_grad() 
+                    accumulated_loss_for_step = torch.tensor(0.0, device=self.device) # Reset for next accumulation cycle
+                    batch_idx_in_epoch +=1
+                    continue
+                
+                # Normalize loss for accumulation
+                loss_to_accumulate = batch_avg_loss / update_step
+                loss_to_accumulate.backward()
+                accumulated_loss_for_step = accumulated_loss_for_step + loss_to_accumulate.detach() # Track accumulated loss for logging
+
+                epoch_loss_train_list.append(batch_avg_loss.item()) # Log actual (non-normalized) batch average loss
+                epoch_acc_train_list.append(batch_acc)
+
+                if (batch_idx_in_epoch + 1) % update_step == 0:
                     torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0)
                     torch.nn.utils.clip_grad_norm_(self.gmodel.parameters(), 1.0)
                     self.optimizer.step()
                     self.optimizer.zero_grad()
+                    
+                    # Log accumulated loss
+                    avg_loss_over_update_steps = accumulated_loss_for_step.item() # This is sum of normalized losses
+                    train_pbar.set_postfix({'Step Loss': f'{avg_loss_over_update_steps:.4f}', 'Batch Acc': f'{batch_acc:.4f}'})
+                    accumulated_loss_for_step = torch.tensor(0.0, device=self.device) # Reset for next cycle
+                
+                batch_idx_in_epoch +=1
 
-                    avg_accum_loss = accumulated_loss # 因為 accumulated_loss 是 update_step 個 normalized_loss 的和
-                    epoch_loss_train.append(avg_accum_loss)
-                    epoch_acc_train.append(batch_acc)
-                    train_pbar.set_postfix({'Loss': f'{avg_accum_loss:.4f}', 'Acc': f'{batch_acc:.4f}'})
-                    accumulated_loss = 0.0
+            # Handle any remaining gradients if epoch size not multiple of update_step
+            if batch_idx_in_epoch % update_step != 0 and accumulated_loss_for_step > 0 :
+                 torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0)
+                 torch.nn.utils.clip_grad_norm_(self.gmodel.parameters(), 1.0)
+                 self.optimizer.step()
+                 self.optimizer.zero_grad()
 
-            avg_epoch_train_loss = np.mean(epoch_loss_train) if epoch_loss_train else float('nan')
-            avg_epoch_train_acc = np.mean(epoch_acc_train) if epoch_acc_train else float('nan')
-            print(f"\nEpoch {ep+1} Average Training Loss: {avg_epoch_train_loss:.4f}, Average Training Acc: {avg_epoch_train_acc:.4f}")
+            avg_epoch_train_loss = np.mean(epoch_loss_train_list) if epoch_loss_train_list else float('nan')
+            avg_epoch_train_acc = np.mean(epoch_acc_train_list) if epoch_acc_train_list else float('nan')
+            print(f"\nEpoch {ep+1} Avg Training Loss: {avg_epoch_train_loss:.4f}, Avg Training Acc: {avg_epoch_train_acc:.4f}")
 
-            # Validation Step
-            avg_epoch_dev_loss, avg_epoch_dev_acc = self.validate(dev_data)
+            # Validation, LR Scheduling, Early Stopping (as before)
+            # ...
+            avg_epoch_dev_loss, avg_epoch_dev_acc = self.validate(dev_data_loader) # Pass loader
             print(f"Epoch {ep+1} Validation Loss: {avg_epoch_dev_loss:.4f}, Validation Acc: {avg_epoch_dev_acc:.4f}")
 
             if lr_scheduler:
-                lr_scheduler.step()
-                print(f"LR Scheduler stepped. Current LR: {self.optimizer.param_groups[0]['lr']:.6f}")
+                lr_scheduler.step() # Or lr_scheduler.step(avg_epoch_dev_loss) if ReduceLROnPlateau
 
-            # --- Early Stopping Logic ---
-            current_metric_val = None
+            # Early Stopping Logic (as before)
+            current_metric_val = avg_epoch_dev_loss if self.early_stopping_metric == 'val_loss' else avg_epoch_dev_acc
+            improved = False
             if self.early_stopping_metric == 'val_loss':
-                current_metric_val = avg_epoch_dev_loss
-                # 檢查是否有改善 (損失越低越好)
                 if current_metric_val < self.best_metric_val - self.early_stopping_delta:
-                    print(f"Validation loss improved ({self.best_metric_val:.4f} --> {current_metric_val:.4f}). Saving model...")
-                    self.best_metric_val = current_metric_val
-                    self.epochs_no_improve = 0
-                    if self.save_model_path:
-                        try:
-                            torch.save(self.gmodel.state_dict(), self.save_model_path)
-                            encoder_save_path = os.path.join(os.path.dirname(self.save_model_path), "encoder.pth")
-                            torch.save(self.encoder.state_dict(), encoder_save_path)
-                            print(f"Model saved to {self.save_model_path} and {encoder_save_path}")
-                        except Exception as e:
-                            print(f"Error saving model: {e}")
-                else:
-                    self.epochs_no_improve += 1
-                    print(f"Validation loss did not improve for {self.epochs_no_improve} epoch(s). Best: {self.best_metric_val:.4f}")
-
-            elif self.early_stopping_metric == 'val_acc':
-                current_metric_val = avg_epoch_dev_acc
-                # 檢查是否有改善 (準確率越高越好)
+                    improved = True
+            else: # val_acc
                 if current_metric_val > self.best_metric_val + self.early_stopping_delta:
-                    print(f"Validation accuracy improved ({self.best_metric_val:.4f} --> {current_metric_val:.4f}). Saving model...")
-                    self.best_metric_val = current_metric_val
-                    self.epochs_no_improve = 0
-                    if self.save_model_path:
-                        try:
-                            torch.save(self.gmodel.state_dict(), self.save_model_path)
-                            encoder_save_path = os.path.join(os.path.dirname(self.save_model_path), "encoder.pth")
-                            torch.save(self.encoder.state_dict(), encoder_save_path)
-                            print(f"Model saved to {self.save_model_path} and {encoder_save_path}")
-                        except Exception as e:
-                            print(f"Error saving model: {e}")
-                else:
-                    self.epochs_no_improve += 1
-                    print(f"Validation accuracy did not improve for {self.epochs_no_improve} epoch(s). Best: {self.best_metric_val:.4f}")
+                    improved = True
+            
+            if improved:
+                print(f"Metric improved ({self.best_metric_val:.4f} --> {current_metric_val:.4f}). Saving model...")
+                self.best_metric_val = current_metric_val
+                self.epochs_no_improve = 0
+                if self.save_model_path:
+                    try:
+                        torch.save(self.gmodel.state_dict(), self.save_model_path)
+                        encoder_save_path = os.path.join(os.path.dirname(self.save_model_path), "encoder.pth")
+                        torch.save(self.encoder.state_dict(), encoder_save_path)
+                        print(f"Model saved to {self.save_model_path} and {encoder_save_path}")
+                    except Exception as e: print(f"Error saving model: {e}")
+            else:
+                self.epochs_no_improve += 1
+                print(f"Metric did not improve for {self.epochs_no_improve} epoch(s). Best: {self.best_metric_val:.4f}")
 
             if self.epochs_no_improve >= self.early_stopping_patience:
                 self.early_stop = True
-                print(f"\nEarly stopping triggered after {ep+1} epochs due to no improvement for {self.early_stopping_patience} consecutive epochs.")
-                break # 跳出訓練循環
+                print(f"\nEarly stopping triggered after {ep+1} epochs.")
+                break 
             print("-" * 50)
+        
+        if not self.early_stop: print("Training finished after all epochs.")
 
-        if not self.early_stop:
-            print("Training finished after all epochs.")
 
-
-    def validate(self, dev_data):
-        """Validation loop."""
+    def validate(self, dev_data_loader):
+        # (Validation loop logic, as defined before, calling self.forward_per_batch)
+        # ...
         print("Running validation...")
-        self.mode = 'eval'
+        self.mode = 'eval' # Set mode to eval
         self.encoder.eval()
         self.gmodel.eval()
-        epoch_loss_dev = []
-        epoch_acc_dev = []
-        dev_pbar = tqdm(dev_data, desc="Validation")
+        epoch_loss_dev_list = []
+        epoch_acc_dev_list = []
+        dev_pbar = tqdm(dev_data_loader, desc="Validation")
 
         with torch.no_grad():
             for batch in dev_pbar:
                 if batch is None: continue
+                batch_avg_loss, final_predictions_str = self.forward_per_batch(batch)
+                target_cuis_str_for_acc = batch['hop2_target_cuis'] # Final hop GT
+                batch_acc = self.measure_accuracy(final_predictions_str, target_cuis_str_for_acc)
 
-                batch_loss, final_predictions = self.forward_per_batch(batch)
+                epoch_loss_dev_list.append(batch_avg_loss.item())
+                epoch_acc_dev_list.append(batch_acc)
+                dev_pbar.set_postfix({'Loss': f'{batch_avg_loss.item():.4f}', 'Acc': f'{batch_acc:.4f}'})
 
-                # Ensure target_cuis_batch uses the hop2 targets for final accuracy calculation
-                target_cuis_batch = batch['hop2_target_cuis']
-                batch_acc = self.measure_accuracy(final_predictions, target_cuis_batch, mode="Recall@N")
-
-                epoch_loss_dev.append(batch_loss.item())
-                epoch_acc_dev.append(batch_acc)
-                dev_pbar.set_postfix({
-                    'Loss': f'{batch_loss.item():.4f}',
-                    'Acc': f'{batch_acc:.4f}'
-                    })
-
-        avg_loss = np.mean(epoch_loss_dev) if epoch_loss_dev else 0.0
-        avg_acc = np.mean(epoch_acc_dev) if epoch_acc_dev else 0.0
+        avg_loss = np.mean(epoch_loss_dev_list) if epoch_loss_dev_list else float('nan')
+        avg_acc = np.mean(epoch_acc_dev_list) if epoch_acc_dev_list else float('nan')
         return avg_loss, avg_acc
-
 
 
 # ====================== Main Block ======================
 if __name__ =='__main__':
 
+   
+    
     # --- 常規設置與資源加載 (假設這些已存在或從 args 讀取) ---
     # !!! 確保這些變量已定義並加載好 !!!
     # args = parser.parse_args() # 如果使用 argparse
-    TEST_TOKENIZER_PATH = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
-    GRAPH_FILE = "./drknows/SNOMED_CUI_MAJID_Graph_wSelf.pkl"
-    PRETRAIN_VOCAB_EMBEDDING = "./drknows/GraphModel_SNOMED_CUI_Embedding.pkl"
-    # CUI_VOCAB_FILE = "./drknows/sm_t047_cui_aui_eng.pkl"
+    TEST_TOKENIZER_PATH = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext" # 或者您的本地路徑
+    GRAPH_NX_FILE = "./drknows/SNOMED_CUI_MAJID_Graph_wSelf.pkl" # 原始 NetworkX 圖
+    
+    CUI_EMBEDDING_FILE = "./drknows/GraphModel_SNOMED_CUI_Embedding.pkl"
+    
     TRAIN_ANNOTATION_FILE = "./MediQ/mediq_train_annotations.json"
     DEV_ANNOTATION_FILE = './MediQ/mediq_dev_annotations.json'
-    tokenizer = AutoTokenizer.from_pretrained(TEST_TOKENIZER_PATH) # 使用測試代碼中的路徑或 args
-    encoder = AutoModel.from_pretrained(TEST_TOKENIZER_PATH).to(torch.device('cuda')) # 加載 SapBERT 並移到 GPU
-    g = pickle.load(open(GRAPH_FILE, "rb")) # 加載圖譜
-    cui_embedding = CuiEmbedding(PRETRAIN_VOCAB_EMBEDDING) # 加載 CUI 嵌入
-    #all_edge_mappings = pickle.load(open(ALL_EDGE_MAPPINGS_FILE,"rb")) # 加載邊緣映射
-    # cui_vocab = pickle.load(open(CUI_VOCAB_FILE,"rb")) # 加載 CUI 詞彙表
-    # cui_weights = json.load(open(CUI_WEIGHT_PATH,"r")) # 如果有 CUI 權重文件
-    cui_weights = None # 暫時設為 None
-
-    # --- 動態創建 cui_vocab ---
-    print("從圖譜節點動態創建 CUI -> Index 映射...")
-    try:
-        # 獲取圖譜中所有節點 (CUIs)，並排序以保證映射一致性
-        all_graph_cuis = sorted(list(g.nodes()))
-        # 創建 CUI 到 index 的映射
-        cui_vocab = {cui: i for i, cui in enumerate(all_graph_cuis)}
-        # print(f"成功創建 cui_vocab，包含 {len(cui_vocab)} 個 CUIs。")
-        # 可選：保存這個動態創建的詞彙表供後續使用
-        # with open("generated_cui_vocab_idx.pkl", "wb") as f_out:
-        #     pickle.dump(cui_vocab_dynamic, f_out)
-    except Exception as e:
-        print(f"從圖譜創建 cui_vocab 時出錯: {e}")
-        exit()
-
-
-    # 其他超參數
-    hdim = 768
-    nums_of_head = 3 # 可能不用於 TriAttn
-    top_n = 8 
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    epochs = 300 
-    LR = 1e-5 
-    intermediate = True # 測試包含中間損失
-    contrastive_learning = True # 測試包含對比損失
-    batch_size = 16 
-    save_model_dir = "./saved_models_mediq"
-    if not os.path.exists(save_model_dir):
-        os.makedirs(save_model_dir)
-    save_model_path = os.path.join(save_model_dir, "gmodel_mediq_best.pth")
-
-
+    print(f"Using device: {device}")
+    
+    tokenizer = AutoTokenizer.from_pretrained(TEST_TOKENIZER_PATH)
+    base_encoder_model = AutoModel.from_pretrained(TEST_TOKENIZER_PATH) # Will be moved to device in Trainer
+    
+    # Load NetworkX graph first
+    try:
+        g_nx_loaded = pickle.load(open(GRAPH_NX_FILE, "rb"))
+        print(f"NetworkX graph loaded successfully from {GRAPH_NX_FILE}")
+    except Exception as e:
+        print(f"Error loading NetworkX graph: {e}")
+        exit()
+        
+    try:
+        # 將 device 傳遞給 CuiEmbedding 的構造函數
+        cui_embedding_lookup_obj = CuiEmbedding(CUI_EMBEDDING_FILE, device=device)
+        print("真實 CuiEmbedding 實例化成功。")
+    except Exception as e:
+        print(f"實例化 CuiEmbedding 時出錯: {e}"); exit()
+    
 
     
-    print("Instantiating Trainer...")
-    trainer = Trainer(
+    print("從已加載的圖譜創建 CUI string to global index mapping for Trainer...")
+    _nodes_for_vocab = sorted(list(g_nx_loaded.nodes()))
+    cui_vocab_for_trainer = {cui_str: i for i, cui_str in enumerate(_nodes_for_vocab)}
+    print(f"Trainer's cui_vocab_str_to_idx created with {len(cui_vocab_for_trainer)} entries.")
+
+    
+
+
+    # Hyperparameters
+    hdim = base_encoder_model.config.hidden_size
+    nums_of_head = 3 
+    top_n = 8 
+    epochs = 300 
+    LR = 1e-5 
+    intermediate_loss_flag = True 
+    contrastive_flag = True 
+    batch_size = 1 
+    
+    gin_hidden_dim_val = hdim 
+    gin_num_layers_val = 2  
+
+
+    temp_edge_enc = EdgeOneHot(graph=g_nx_loaded)
+    actual_input_edge_dim_for_gin = temp_edge_enc.onehot_mat.shape[-1]
+    if actual_input_edge_dim_for_gin == 0 and g_nx_loaded.number_of_edges() > 0:
+        print("警告: 為 GIN 確定的 input_edge_dim 是 0。GIN 可能無法按預期工作，如果它需要邊緣特徵。")
+        
+    save_model_dir = "./saved_models_mediq" # 改個目錄名
+    if not os.path.exists(save_model_dir): os.makedirs(save_model_dir)
+    model_save_path = os.path.join(save_model_dir, "gmodel_mediq_best.pth")
+
+    print("Instantiating Trainer with Tensorized GraphModel call and REAL Embeddings...")
+    trainer_instance = Trainer(
         tokenizer=tokenizer,
-        encoder=encoder,
-        g=g,
-        cui_embedding=cui_embedding,
+        encoder=base_encoder_model,
+        g_nx=g_nx_loaded,
+        cui_embedding_lookup=cui_embedding_lookup_obj, # *** 使用真實的嵌入對象 ***
         hdim=hdim,
         nums_of_head=nums_of_head,
-        cui_vocab=cui_vocab,
-        # nums_of_hops=2, # 已在內部設為 2
+        cui_vocab_str_to_idx=cui_vocab_for_trainer,
         top_n=top_n,
         device=device,
         nums_of_epochs=epochs, 
         LR=LR,
-        cui_weights=cui_weights,
-        contrastive_learning=contrastive_learning,
-        intermediate=intermediate,
-        save_model_path=save_model_path, 
-        early_stopping_patience=5, # 例如，如果連續5個epoch沒有改善則停止
-        early_stopping_metric='val_loss', # 可以是 'val_loss' 或 'val_acc'
-        early_stopping_delta=0.001 # 只有當改善大於此值才算
-        # 其他可選參數...
+        cui_weights_dict=None, 
+        contrastive_learning=contrastive_flag,
+        intermediate=intermediate_loss_flag,
+        save_model_path=model_save_path,
+        gnn_update=True, 
+        path_encoder_type="MLP",
+        path_ranker_type="Flat",
+        gnn_type="Stack", 
+        gin_hidden_dim=gin_hidden_dim_val,
+        gin_num_layers=gin_num_layers_val,
+        input_edge_dim_for_gin=actual_input_edge_dim_for_gin,
+        early_stopping_patience=3,
+        early_stopping_metric='val_loss'
     )
-    # trainer.to(device) # Trainer __init__ 內部應已處理
-    print("Trainer instantiated successfully.")
+    print("Trainer instantiated.")
 
     print("\nCreating optimizer...")
-    trainer.create_optimizers()
-    lr_scheduler= torch.optim.lr_scheduler.StepLR(trainer.optimizer, step_size=3, gamma=0.6)
-    # --- 加載測試數據 ---
-    print("\nLoading data batch...")
-    try:
-        train_dataset = MediQAnnotatedDataset(TRAIN_ANNOTATION_FILE, tokenizer)
-        dev_dataset = MediQAnnotatedDataset(DEV_ANNOTATION_FILE, tokenizer)
-    except Exception as e:
-        print(f"加載數據集時出錯: {e}")
-        exit()   
-    if len(train_dataset) == 0 or len(dev_dataset) == 0:
-        print("Error: dataset is empty!")
-        exit()
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths)
-    dev_loader = DataLoader(dev_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths)
+    trainer_instance.create_optimizers()
+    lr_scheduler_instance = None 
 
-    
-    print("\n" + "="*30)
-    print(" STARTING FORMAL TRAINING RUN ")
-    print("="*30 + "\n")
-    
+    print("\nLoading datasets...")
     try:
-        trainer.train(train_loader, dev_loader, lr_scheduler)
+        train_dataset_obj = MediQAnnotatedDataset(TRAIN_ANNOTATION_FILE, tokenizer)
+        dev_dataset_obj = MediQAnnotatedDataset(DEV_ANNOTATION_FILE, tokenizer)
     except Exception as e:
-        print(f"Error during Training: {e}")
+        print(f"Error loading datasets: {e}"); exit()
+        
+    if len(train_dataset_obj) == 0 or len(dev_dataset_obj) == 0:
+        print("Error: A dataset is empty after loading!"); exit()
+
+    train_loader_instance = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_mediq_paths)
+    dev_loader_instance = DataLoader(dev_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths)
+    print("Dataloaders created.")
+
+    print("\n" + "="*30 + "\n STARTING Tensorized Trainer RUN (REAL EMBEDDINGS) \n" + "="*30 + "\n")
+    try: 
+        trainer_instance.train(train_loader_instance, dev_loader_instance, lr_scheduler_instance)
+    except Exception as e:
+        print(f"ERROR DURING TRAINING RUN: {e}")
         import traceback
         traceback.print_exc()
-    
-    print("\n" + "="*30)
-    print(" TRAINING FINISHED ")
-    print("="*30 + "\n")
-
-
+    print("\n" + "="*30 + "\n TENSORIZED TRAINER RUN (REAL EMBEDDINGS) FINISHED \n" + "="*30 + "\n")
 
 
     
