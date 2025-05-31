@@ -48,30 +48,17 @@ except ImportError:
         return out
     
 class MediQAnnotatedDataset(Dataset):
-    """
-    Loads annotated MediQ data (with facts, CUIs, and pre-calculated paths)
-    and performs dynamic sampling of known/unknown facts for training.
-    Derives hop-specific target CUIs for intermediate loss.
-    """
-    def __init__(self, annotation_file_path, tokenizer, random_seed=2023):
-        """
-        Args:
-            annotation_file_path (str): Path to the JSON annotation file.
-            tokenizer: Pre-initialized Hugging Face tokenizer (e.g., SapBERT).
-            random_seed (int): Seed for reproducible random sampling.
-        """
-        print(f"載入標註數據: {annotation_file_path}")
+    def __init__(self, annotation_file_path, tokenizer, random_seed=2023, min_facts_for_sampling=2):
+        # ... __init__ 的前半部分與之前相同，無需修改 ...
+        print(f"載入並預處理標註數據: {annotation_file_path}")
+        self.min_facts_for_sampling = max(2, min_facts_for_sampling)
+        self.tokenizer = tokenizer
+        self.random = random.Random(random_seed)
+        self.valid_training_samples = [] 
+
         try:
             with open(annotation_file_path, 'r', encoding='utf-8') as f:
-                self.all_annotations = json.load(f)
-            # 過濾掉 facts 數量少於 2 的案例 (因為至少需要1知1未知)
-            self.case_ids = [
-                cid for cid, data in self.all_annotations.items()
-                if len(data.get("atomic_facts", [])) >= 2
-            ]
-            if len(self.case_ids) < len(self.all_annotations):
-                print(f"警告: 已過濾掉 {len(self.all_annotations) - len(self.case_ids)} 個 atomic_facts 少於 2 的案例。")
-            print(f"成功載入並篩選後共 {len(self.case_ids)} 筆有效案例。")
+                all_annotations = json.load(f)
         except FileNotFoundError:
             print(f"錯誤：找不到標註文件 {annotation_file_path}。")
             raise
@@ -79,140 +66,165 @@ class MediQAnnotatedDataset(Dataset):
             print(f"載入標註文件時發生錯誤: {e}")
             raise
 
-        self.tokenizer = tokenizer
-        self.random = random.Random(random_seed) # Use an instance for reproducibility
+        num_cases_before_filter = len(all_annotations)
+        num_cases_after_min_facts_filter = 0
+
+        for case_id, data in all_annotations.items():
+            atomic_facts = data.get("atomic_facts", [])
+            facts_cuis = data.get("facts_cuis", [])
+            paths_between_facts = data.get("paths_between_facts", {})
+            num_facts = len(atomic_facts)
+
+            if num_facts < self.min_facts_for_sampling or len(facts_cuis) != num_facts:
+                continue
+            num_cases_after_min_facts_filter += 1
+
+            for i in range(num_facts):
+                for j in range(num_facts):
+                    if i == j:
+                        continue
+                    
+                    path_key = f"{i}_{j}"
+                    if path_key in paths_between_facts and paths_between_facts[path_key]:
+                        if facts_cuis[j]:
+                            has_valid_target_in_path = False
+                            for path_data in paths_between_facts[path_key]:
+                                if not path_data or not isinstance(path_data, list): continue
+                                target_cui_in_path = path_data[-1]
+                                if isinstance(target_cui_in_path, str) and target_cui_in_path.startswith('C') and \
+                                   target_cui_in_path in facts_cuis[j]:
+                                    has_valid_target_in_path = True
+                                    break
+                            if has_valid_target_in_path:
+                                self.valid_training_samples.append({
+                                    "case_id": case_id,
+                                    "guaranteed_known_idx": i,
+                                    "guaranteed_unknown_idx": j,
+                                })
+        
+        self.all_annotations_data = all_annotations
+
+        print(f"原始案例數: {num_cases_before_filter}")
+        print(f"通過最小事實數 ({self.min_facts_for_sampling}) 和 CUI 長度檢查的案例數: {num_cases_after_min_facts_filter}")
+        print(f"構建的有效 (known_idx, unknown_idx) 訓練樣本對數量: {len(self.valid_training_samples)}")
+
+        if not self.valid_training_samples:
+            print("警告: 預處理後沒有找到任何有效的訓練樣本對。請檢查數據和 `paths_between_facts` 的內容。")
 
     def __len__(self):
-        return len(self.case_ids)
+        return len(self.valid_training_samples)
 
     def __getitem__(self, index):
-        """
-        Fetches data for one case, performs dynamic sampling, prepares model inputs,
-        and derives hop-specific target CUIs.
-        """
-        case_id = self.case_ids[index]
-        data = self.all_annotations[case_id]
-
+        sample_info = self.valid_training_samples[index]
+        case_id = sample_info["case_id"]
+        guaranteed_known_idx = sample_info["guaranteed_known_idx"]
+        guaranteed_unknown_idx = sample_info["guaranteed_unknown_idx"]
+        
+        data = self.all_annotations_data[case_id]
         atomic_facts = data["atomic_facts"]
-        facts_cuis = data["facts_cuis"] # List of lists
-        paths_between_facts = data.get("paths_between_facts", {}) # Use .get for safety
+        facts_cuis = data["facts_cuis"]
+        paths_between_facts = data.get("paths_between_facts", {})
         num_facts = len(atomic_facts)
 
-        # 之前的檢查已在 __init__ 中完成，這裡 num_facts 必定 >= 2
+        known_indices = {guaranteed_known_idx}
+        unknown_indices = {guaranteed_unknown_idx}
 
-        # --- Dynamic Sampling ---
-        all_indices = set(range(num_facts))
-        known_indices = {0}
-        remaining_indices = list(all_indices - known_indices)
+        remaining_indices = list(set(range(num_facts)) - known_indices - unknown_indices)
+        self.random.shuffle(remaining_indices)
 
-        # 至少保留一個未知 fact
-        num_unknown = self.random.randint(1, len(remaining_indices))
-        unknown_indices = set(self.random.sample(remaining_indices, num_unknown))
-        known_indices.update(set(remaining_indices) - unknown_indices)
-        target_unknown_idx = self.random.choice(list(unknown_indices))
-        # --- End Dynamic Sampling ---
+        if remaining_indices:
+            num_additional_known = self.random.randint(0, len(remaining_indices))
+            known_indices.update(remaining_indices[:num_additional_known])
+            unknown_indices.update(remaining_indices[num_additional_known:])
 
-        # --- Prepare Model Inputs ---
-        # 1. Known Text Input (for h_text)
-        known_texts = " ".join([atomic_facts[i] for i in sorted(list(known_indices))])
-        input_text_tks = self.tokenizer(known_texts,
-                                        truncation=True,
-                                        padding="max_length",
-                                        max_length=512, # Adjust as needed
-                                        return_tensors="pt")
+        known_texts_list = [atomic_facts[i] for i in sorted(list(known_indices))]
+        known_texts_combined = " ".join(known_texts_list) if known_texts_list else "N/A"
+
+        input_text_tks = self.tokenizer(known_texts_combined,
+                                        truncation=True, padding="max_length",
+                                        max_length=512, return_tensors="pt")
         input_text_tks = {k: v.squeeze(0) for k, v in input_text_tks.items()}
 
-        # 2. Known CUIs (for h_con - returned as list for now)
-        known_cuis_list = []
+        known_cuis_list_flat = []
         for i in known_indices:
-            # 確保 facts_cuis[i] 是列表，即使為空
-            known_cuis_list.extend(facts_cuis[i] if isinstance(facts_cuis[i], list) else [])
-        known_cuis_list = list(set(known_cuis_list)) # Unique known CUIs
-
-        # 3. Candidate Paths (Retrieved based on known -> target_unknown)
-        #    These are the pre-calculated GT paths for loss calculation reference
-        gt_candidate_paths = []
-        for i in known_indices:
-            path_key = f"{i}_{target_unknown_idx}"
-            if path_key in paths_between_facts:
-                gt_candidate_paths.extend(paths_between_facts[path_key])
-
-        # 4. Derive Hop-Specific Target CUIs from GT Paths
-        hop1_target_cuis = set()
-        hop2_target_cuis = set() # This will collect targets from both 1-hop and 2-hop paths
-
-        for path in gt_candidate_paths:
-            if not path: continue # Skip empty paths if any
-
-            # Assuming path format [CUI_start, Rel1, CUI_mid, Rel2, CUI_end] (len 5) for 2-hop
-            # or [CUI_start, Rel1, CUI_end] (len 3) for 1-hop
-            path_len = len(path)
-            if path_len == 3: # 1-hop path
-                hop1_target_cuis.add(path[2]) # Add the target CUI
-                hop2_target_cuis.add(path[2]) # Also add to final targets
-            elif path_len == 5: # 2-hop path
-                 # The intermediate node path[2] is NOT a hop-1 TARGET, it's a hop-1 step.
-                 # Only the final node path[4] is added to hop2 targets.
-                 # If intermediate loss needs targets reachable *after* 1 hop *via any path*,
-                 # we might need a different definition or path structure.
-                 # Current definition: hop1_target_cuis are CUIs reachable via exactly 1-hop paths.
-                 hop2_target_cuis.add(path[4]) # Add the final target CUI
-            # else: handle potential malformed paths?
+            current_fact_cuis = facts_cuis[i]
+            if isinstance(current_fact_cuis, list):
+                known_cuis_list_flat.extend(current_fact_cuis)
+        known_cuis_list_unique = list(set(known_cuis_list_flat))
+        
+        # ## MODIFIED: 創建三個獨立的集合來儲存不同類型的 GT
+        hop1_target_cuis_set = set()
+        hop2_target_cuis_set = set()
+        intermediate_target_cuis_set = set() # ## ADDED
+        
+        for k_idx in known_indices:
+            for u_idx in unknown_indices:
+                path_key_optional = f"{k_idx}_{u_idx}"
+                if path_key_optional in paths_between_facts:
+                    for path_data in paths_between_facts[path_key_optional]:
+                        if not path_data or not isinstance(path_data, list): continue
+                        path_len = len(path_data)
+                        target_cui_in_path = path_data[-1]
+                        is_valid_cui = isinstance(target_cui_in_path, str) and target_cui_in_path.startswith('C')
+                        
+                        if is_valid_cui and isinstance(facts_cuis[u_idx], list) and \
+                           target_cui_in_path in facts_cuis[u_idx]:
+                            
+                            # ## MODIFIED: 根據路徑長度將目標 CUI 分配到正確的集合
+                            if path_len == 3: # 1-hop path
+                                hop1_target_cuis_set.add(target_cui_in_path)
+                            elif path_len == 5: # 2-hop path
+                                intermediate_cui = path_data[2] # 中間節點
+                                intermediate_target_cuis_set.add(intermediate_cui) # ## ADDED
+                                hop2_target_cuis_set.add(target_cui_in_path) # 最終目標
+        
+        # ## MODIFIED: 修改返回 None 的條件。
+        # 現在，一個樣本被視為無效，如果它連一個 1-hop 或 2-hop 的 GT 都沒有。
+        # 訓練器將決定如何使用這些GT。例如，如果只訓練2-hop，那麼 hop2_target_cuis 為空就可能是個問題。
+        # 為了通用性，我們只要至少有一個GT就返回。
+        if not hop1_target_cuis_set and not hop2_target_cuis_set:
+            return None
 
         return {
             "case_id": case_id,
             "known_indices": sorted(list(known_indices)),
-            "target_unknown_idx": target_unknown_idx,
+            "unknown_indices": sorted(list(unknown_indices)),
             "input_text_tks": input_text_tks,
-            "known_cuis": known_cuis_list,
-            # "candidate_paths": gt_candidate_paths, # Keep if needed for triplet loss path embeddings
-            "hop1_target_cuis": list(hop1_target_cuis), # Unique CUIs reachable in exactly 1 hop via GT paths
-            "hop2_target_cuis": list(hop2_target_cuis)  # Unique CUIs reachable in 1 or 2 hops via GT paths
+            "known_cuis": known_cuis_list_unique,
+            "hop1_target_cuis": list(hop1_target_cuis_set),
+            "hop2_target_cuis": list(hop2_target_cuis_set),
+            "intermediate_target_cuis": list(intermediate_target_cuis_set), # ## ADDED
         }
 
 
-# --- 修改後的 Collate Function ---
 def collate_fn_mediq_paths(batch):
-    """
-    Collate function for the MediQAnnotatedDataset.
-    Handles padding for tokenized text, returns lists for variable-length items.
-    Filters out None items resulting from sampling errors in __getitem__.
-    """
-    # Filter out None items first
-    batch = [item for item in batch if item is not None]
-    if not batch: # If all items in the batch were None
+    valid_items_in_batch = [item for item in batch if item is not None]
+    if not valid_items_in_batch:
         return None
+    
+    # 提取所有鍵
+    case_ids = [item['case_id'] for item in valid_items_in_batch]
+    input_ids = [item['input_text_tks']['input_ids'] for item in valid_items_in_batch]
+    attention_mask = [item['input_text_tks']['attention_mask'] for item in valid_items_in_batch]
+    known_cuis = [item['known_cuis'] for item in valid_items_in_batch]
+    hop1_target_cuis = [item['hop1_target_cuis'] for item in valid_items_in_batch]
+    hop2_target_cuis = [item['hop2_target_cuis'] for item in valid_items_in_batch]
+    intermediate_target_cuis = [item['intermediate_target_cuis'] for item in valid_items_in_batch] # ## ADDED
 
-    # Gather different parts of the data
-    case_ids = [item['case_id'] for item in batch]
-    known_indices = [item['known_indices'] for item in batch]
-    target_unknown_idx = [item['target_unknown_idx'] for item in batch]
-    input_ids = [item['input_text_tks']['input_ids'] for item in batch]
-    attention_mask = [item['input_text_tks']['attention_mask'] for item in batch]
-    known_cuis = [item['known_cuis'] for item in batch] # List of lists
-    # candidate_paths = [item['candidate_paths'] for item in batch] # List of lists of lists
-    hop1_target_cuis = [item['hop1_target_cuis'] for item in batch] # List of lists
-    hop2_target_cuis = [item['hop2_target_cuis'] for item in batch] # List of lists
+    # 填充
+    input_ids_padded = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
+    attention_mask_padded = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
 
-
-    # Pad tokenized text inputs
-    # Assuming tokenizer.pad_token_id is 0, adjust if necessary
-    input_ids_padded = pad_sequence(input_ids, batch_first=True, padding_value=0)
-    attention_mask_padded = pad_sequence(attention_mask, batch_first=True, padding_value=0)
-
-    # Package the batch
     return {
         "case_id": case_ids,
-        "known_indices": known_indices,
-        "target_unknown_idx": target_unknown_idx,
         "input_text_tks_padded": {
             "input_ids": input_ids_padded,
             "attention_mask": attention_mask_padded
         },
-        "known_cuis": known_cuis, # Return as list of lists
-        # "candidate_paths": candidate_paths, # Return if needed later
-        "hop1_target_cuis": hop1_target_cuis, # Return as list of lists
-        "hop2_target_cuis": hop2_target_cuis # Return as list of lists
+        "known_cuis": known_cuis,
+        "hop1_target_cuis": hop1_target_cuis,
+        "hop2_target_cuis": hop2_target_cuis,
+        "intermediate_target_cuis": intermediate_target_cuis, # ## ADDED
     }
 
 
@@ -317,129 +329,111 @@ def preprocess_graph_to_tensors(graph_nx):
 def retrieve_neighbors_paths_no_self_tensorized(
     current_cui_str_list, 
     tensor_graph, 
-    prev_candidate_tensors=None
+    prev_candidate_tensors=None # 這個現在可能包含 "selected_first_hop_edge_idx"
 ):
-    """
-    Retrieves 1-hop neighbor paths using tensor operations.
-    Args:
-        current_cui_str_list (list[str]): List of CUI strings to start searching from.
-        tensor_graph (dict): Dictionary containing tensorized graph representations
-                             (adj_src, adj_tgt, adj_edge_type, cui_to_idx, etc.).
-        prev_candidate_tensors (dict, optional): Tensors from the previous hop,
-                                                 containing 'src_indices', 'tgt_indices'.
-                                                 Used to build multi-hop path memory.
-    Returns:
-        tuple:
-            - candidate_src_indices (torch.Tensor): Source CUI indices for found 1-hop paths. [num_paths]
-            - candidate_tgt_indices (torch.Tensor): Target CUI indices for found 1-hop paths. [num_paths]
-            - candidate_edge_type_indices (torch.Tensor): Edge type indices for found 1-hop paths. [num_paths]
-            - path_memory_src_prev_hop (torch.Tensor or None): For 2+ hops, CUI indices of the *original* source
-                                                               of the paths extended in this hop. [num_paths]
-                                                               None for 1st hop.
-    """
+    device = tensor_graph['adj_src'].device
     if not current_cui_str_list:
-        return torch.tensor([], dtype=torch.long), \
-               torch.tensor([], dtype=torch.long), \
-               torch.tensor([], dtype=torch.long), \
-               None
+        return torch.tensor([], dtype=torch.long, device=device), \
+               torch.tensor([], dtype=torch.long, device=device), \
+               torch.tensor([], dtype=torch.long, device=device), \
+               None, \
+               None # ## ADDED: for mem_first_edge_idx_hop
 
     cui_to_idx = tensor_graph['cui_to_idx']
-    
-    # Convert current CUI strings to indices
-    current_cui_indices = []
-    for cui_str in current_cui_str_list:
-        if cui_str in cui_to_idx:
-            current_cui_indices.append(cui_to_idx[cui_str])
-    
+    current_cui_indices = [cui_to_idx[s] for s in current_cui_str_list if s in cui_to_idx]
     if not current_cui_indices:
-        return torch.tensor([], dtype=torch.long), \
-               torch.tensor([], dtype=torch.long), \
-               torch.tensor([], dtype=torch.long), \
-               None
-    device = tensor_graph['adj_src'].device         
-    current_cui_indices_tensor = torch.tensor(list(set(current_cui_indices)), dtype=torch.long, device=device) # Unique current sources
+        return torch.tensor([], dtype=torch.long, device=device), \
+               torch.tensor([], dtype=torch.long, device=device), \
+               torch.tensor([], dtype=torch.long, device=device), \
+               None, \
+               None # ## ADDED
 
-    # Find edges originating from the current_cui_indices_tensor
-    # Create a mask for relevant source nodes in the graph's adjacency list
-    # graph_adj_src shape: [total_num_edges_in_graph]
-    # current_cui_indices_tensor shape: [num_current_sources]
-    # We want to find all edges where graph_adj_src is one of current_cui_indices_tensor
-    
-    # Efficiently find matching edges:
-    # Create a boolean mask by checking for each edge if its source is in current_cui_indices_tensor
-    # This can be slow if current_cui_indices_tensor is large.
-    # A better way for many sources: iterate through current_cui_indices_tensor and gather.
-    
-    path_src_list = []
-    path_tgt_list = []
-    path_edge_type_list = []
-    path_memory_src_prev_hop_list = [] # For 2+ hop tracking
+    current_cui_indices_tensor = torch.tensor(list(set(current_cui_indices)), dtype=torch.long, device=device)
+
+    path_src_list, path_tgt_list, path_edge_type_list = [], [], []
+    path_memory_src_prev_hop_list = []
+    path_memory_first_edge_idx_list = [] # ## ADDED: 儲存第一跳邊索引的列表
 
     adj_src_graph = tensor_graph['adj_src']
     adj_tgt_graph = tensor_graph['adj_tgt']
     adj_edge_type_graph = tensor_graph['adj_edge_type']
 
     for i, src_idx_current_hop in enumerate(current_cui_indices_tensor):
-        # Find all edges in the graph where the source is src_idx_current_hop
         mask_src_is_current = (adj_src_graph == src_idx_current_hop)
-        
-        if not torch.any(mask_src_is_current): # No outgoing edges from this source
+        if not torch.any(mask_src_is_current):
             continue
 
-        srcs_for_paths = adj_src_graph[mask_src_is_current] # These will all be src_idx_current_hop
+        srcs_for_paths = adj_src_graph[mask_src_is_current]
         tgts_for_paths = adj_tgt_graph[mask_src_is_current]
         edge_types_for_paths = adj_edge_type_graph[mask_src_is_current]
         
+        num_new_paths = srcs_for_paths.size(0)
+
         path_src_list.append(srcs_for_paths)
         path_tgt_list.append(tgts_for_paths)
         path_edge_type_list.append(edge_types_for_paths)
 
-        if prev_candidate_tensors is not None and 'src_indices_orig' in prev_candidate_tensors:
-            # If it's the second hop or more, we need to carry forward the *original* source CUI index
-            # from the path that led to `src_idx_current_hop`.
-            # `prev_candidate_tensors['tgt_indices']` contains the nodes that became sources for this hop.
-            # `prev_candidate_tensors['src_indices_orig']` contains the original sources for those paths.
+        current_hop_memory_source = src_idx_current_hop # 默認為當前節點 (用於第一跳或回退)
+        current_hop_first_edge_memory = None # ## ADDED: 默認為 None
+
+        if prev_candidate_tensors is not None and \
+           'selected_src_orig_idx' in prev_candidate_tensors and \
+           prev_candidate_tensors['selected_src_orig_idx'] is not None and \
+           'selected_hop_target_idx' in prev_candidate_tensors:
             
-            # Find which of the previous hop's target nodes matches src_idx_current_hop
-            prev_tgt_mask = (prev_candidate_tensors['tgt_indices'] == src_idx_current_hop)
-            if torch.any(prev_tgt_mask):
-                # Get the original source(s) that led to src_idx_current_hop
-                # If multiple paths led to src_idx_current_hop, we might need to duplicate or handle this.
-                # For simplicity, let's assume one main path or take the first.
-                original_source_for_this_src = prev_candidate_tensors['src_indices_orig'][prev_tgt_mask][0] # Take the first one
-                path_memory_src_prev_hop_list.append(original_source_for_this_src.repeat(srcs_for_paths.size(0)))
-            else:
-                # This case should be rare if src_idx_current_hop came from prev_candidate_tensors['tgt_indices']
-                # If src_idx_current_hop was an initial CUI, and it's not the first hop, something is off.
-                # For first hop, prev_candidate_tensors is None.
-                # Fallback: use src_idx_current_hop if original source cannot be traced
-                path_memory_src_prev_hop_list.append(src_idx_current_hop.repeat(srcs_for_paths.size(0)))
-        else: # First hop, the source of the path is the source of the memory
-            path_memory_src_prev_hop_list.append(src_idx_current_hop.repeat(srcs_for_paths.size(0)))
+            mask_in_prev_targets = (prev_candidate_tensors['selected_hop_target_idx'] == src_idx_current_hop)
+            if torch.any(mask_in_prev_targets):
+                original_source_candidates = prev_candidate_tensors['selected_src_orig_idx'][mask_in_prev_targets]
+                if original_source_candidates.numel() > 0:
+                    current_hop_memory_source = original_source_candidates[0]
+                
+                # ## ADDED: 檢查並獲取第一跳的邊索引
+                if 'selected_first_hop_edge_idx' in prev_candidate_tensors and \
+                   prev_candidate_tensors['selected_first_hop_edge_idx'] is not None:
+                    first_edge_candidates = prev_candidate_tensors['selected_first_hop_edge_idx'][mask_in_prev_targets]
+                    if first_edge_candidates.numel() > 0:
+                        current_hop_first_edge_memory = first_edge_candidates[0]
+        
+        path_memory_src_prev_hop_list.append(current_hop_memory_source.repeat(num_new_paths))
+        if current_hop_first_edge_memory is not None: # ## ADDED
+            path_memory_first_edge_idx_list.append(current_hop_first_edge_memory.repeat(num_new_paths))
+        else: # ## ADDED: 如果沒有第一跳邊信息，用一個特殊值填充，例如 -1，或保持與路徑數量匹配的 None 列表
+              # 這裡用 -1 填充，假設邊索引都是非負的
+            path_memory_first_edge_idx_list.append(torch.full((num_new_paths,), -1, dtype=torch.long, device=device))
 
 
-    if not path_src_list: # No paths found at all
-        return torch.tensor([], dtype=torch.long), \
-               torch.tensor([], dtype=torch.long), \
-               torch.tensor([], dtype=torch.long), \
-               None
+    if not path_src_list:
+        return torch.tensor([], dtype=torch.long, device=device), \
+               torch.tensor([], dtype=torch.long, device=device), \
+               torch.tensor([], dtype=torch.long, device=device), \
+               None, \
+               None # ## ADDED
 
     candidate_src_indices = torch.cat(path_src_list)
     candidate_tgt_indices = torch.cat(path_tgt_list)
     candidate_edge_type_indices = torch.cat(path_edge_type_list)
     
     path_memory_src_prev_hop_tensor = torch.cat(path_memory_src_prev_hop_list) if path_memory_src_prev_hop_list else None
+    path_memory_first_edge_idx_tensor = torch.cat(path_memory_first_edge_idx_list) if path_memory_first_edge_idx_list else None # ## ADDED
     
-    # Filter out self-loops (src == tgt for the current hop)
-    # This was part of "no_self" in the original name
     non_self_loop_mask = (candidate_src_indices != candidate_tgt_indices)
-    candidate_src_indices = candidate_src_indices[non_self_loop_mask].to(device)
-    candidate_tgt_indices = candidate_tgt_indices[non_self_loop_mask].to(device)
-    candidate_edge_type_indices = candidate_edge_type_indices[non_self_loop_mask].to(device)
-    if path_memory_src_prev_hop_tensor is not None:
-        path_memory_src_prev_hop_tensor = path_memory_src_prev_hop_tensor[non_self_loop_mask].to(device)
+    candidate_src_indices = candidate_src_indices[non_self_loop_mask]
+    candidate_tgt_indices = candidate_tgt_indices[non_self_loop_mask]
+    candidate_edge_type_indices = candidate_edge_type_indices[non_self_loop_mask]
 
-    return candidate_src_indices, candidate_tgt_indices, candidate_edge_type_indices, path_memory_src_prev_hop_tensor
+    if path_memory_src_prev_hop_tensor is not None:
+        if path_memory_src_prev_hop_tensor.size(0) == non_self_loop_mask.size(0):
+            path_memory_src_prev_hop_tensor = path_memory_src_prev_hop_tensor[non_self_loop_mask]
+    
+    if path_memory_first_edge_idx_tensor is not None: # ## ADDED
+        if path_memory_first_edge_idx_tensor.size(0) == non_self_loop_mask.size(0):
+            path_memory_first_edge_idx_tensor = path_memory_first_edge_idx_tensor[non_self_loop_mask]
+
+    return candidate_src_indices.to(device), \
+           candidate_tgt_indices.to(device), \
+           candidate_edge_type_indices.to(device), \
+           path_memory_src_prev_hop_tensor.to(device) if path_memory_src_prev_hop_tensor is not None else None, \
+           path_memory_first_edge_idx_tensor.to(device) if path_memory_first_edge_idx_tensor is not None else None # ## ADDED
 
 
 
@@ -508,7 +502,7 @@ class CuiEmbedding(object):
     Handles values that are numpy.ndarray of shape (1, embedding_dim).
     """
     def __init__(self, embedding_file_path, device=torch.device('cpu')):
-        print(f"載入真實 CUI 嵌入從: {embedding_file_path}")
+        print(f"載入 CUI 嵌入從: {embedding_file_path}")
         try:
             with open(embedding_file_path, 'rb') as f:
                 self.raw_data = pickle.load(f) # CUI_str -> numpy.ndarray (1,768)
@@ -636,7 +630,7 @@ class CuiEmbedding(object):
 
 
 class EdgeOneHot(object): # Using the dynamic one from user's code
-    def __init__(self, graph: nx.DiGraph, unknown_rel_label: str = "UNKNOWN_REL"):
+    def __init__(self, graph: nx.DiGraph, device, unknown_rel_label: str = "UNKNOWN_REL"):
         super().__init__()
         unique_edge_labels = set()
         for _, _, data in graph.edges(data=True):
@@ -648,13 +642,12 @@ class EdgeOneHot(object): # Using the dynamic one from user's code
         self.edge_mappings = {label: i for i, label in enumerate(sorted(list(unique_edge_labels)))}
         self.num_edge_types = len(self.edge_mappings)
         self.unknown_rel_index = self.edge_mappings.get(unknown_rel_label)
+        self.device = device
+        
         if self.num_edge_types == 0: # Handle graph with no edges or no labeled edges
-            # print("Warning: EdgeOneHot found 0 edge types. onehot_mat will be empty or minimal.")
-            # This might lead to issues if edge_dim is expected to be >0 later
-            # For now, create a minimal valid onehot_mat if num_edge_types would be 0
-            self.onehot_mat = torch.empty(0,0).float() # Or torch.zeros(1,1).float() if a min dim is needed
+            self.onehot_mat = torch.empty(0,0, device=self.device).float() # Or torch.zeros(1,1).float() if a min dim is needed
         else:
-            self.onehot_mat = F.one_hot(torch.arange(0, self.num_edge_types), num_classes=self.num_edge_types).float()
+            self.onehot_mat = F.one_hot(torch.arange(0, self.num_edge_types, device=self.device), num_classes=self.num_edge_types).float()
     def Lookup(self, edge_labels: list):
         if self.num_edge_types == 0: # No edge types defined
             # Return a zero tensor of expected dimensionality if possible, or empty.
@@ -671,7 +664,7 @@ class EdgeOneHot(object): # Using the dynamic one from user's code
             if e in self.edge_mappings: indices.append(self.edge_mappings[e])
             elif self.unknown_rel_index is not None: indices.append(self.unknown_rel_index)
             else: indices.append(0) # Fallback
-        indices_tensor = torch.tensor(indices, dtype=torch.long)
+        indices_tensor = torch.tensor(indices, dtype=torch.long, device=self.device)
         indices_tensor = torch.clamp(indices_tensor, 0, self.num_edge_types - 1 if self.num_edge_types > 0 else 0)
         if self.num_edge_types == 0 : # Should not happen if clamp works correctly
             return torch.empty(len(edge_labels), 0)
@@ -788,50 +781,11 @@ class NodeAggregateGIN(nn.Module):
                     transformed_msg = F.relu(self.edge_transform_linear(combined_neighbor_edge_feat))
                     aggregated_msgs[src_local_idx] += transformed_msg.squeeze(0)
         else:
-            # Efficient aggregation using torch_scatter
-            # 1. Combine target node features and edge features for all paths
-            combined_neighbor_edge_feats = torch.cat((path_target_node_features, path_edge_features), dim=-1)
             
-            # 2. Transform these combined features (message from neighbor+edge)
-            # Output shape: [total_paths_from_these_srcs, hidden_dim]
+            combined_neighbor_edge_feats = torch.cat((path_target_node_features, path_edge_features), dim=-1)
+                     
             transformed_messages = F.relu(self.edge_transform_linear(combined_neighbor_edge_feats))
             
-            # 3. Aggregate messages for each source node
-            # We need to map global `path_source_indices_global` to local indices [0, num_unique_src-1]
-            # This mapping should align with `x_src_unique`.
-            # `unique_src_to_process_indices` gives the global indices of nodes in `x_src_unique`.
-            # We need to find where each `path_source_indices_global` entry falls in `unique_src_to_process_indices`.
-            
-            # A simple way if unique_src_to_process_indices is sorted and path_source_indices_global contains its elements:
-            # (This assumes path_source_indices_global are already mapped or can be mapped to 0..N-1 indices for scatter)
-            # For scatter, the `index` argument should be local indices for the output tensor.
-            
-            # Let's create the local scatter_index:
-            # map_global_to_local_idx = {global_idx.item(): i for i, global_idx in enumerate(unique_src_to_process_indices)}
-            # scatter_index = torch.tensor(
-            #     [map_global_to_local_idx[glob_idx.item()] for glob_idx in path_source_indices_global],
-            #     dtype=torch.long, device=self.device
-            # )
-            # --- More robust way to get scatter_index ---
-            # Create a "compressed" version of path_source_indices_global
-            # Example: unique_src_to_process_indices = [10, 20, 30] (global IDs)
-            #          path_source_indices_global = [10, 20, 10, 30, 20] (global IDs)
-            # We want scatter_index = [0, 1, 0, 2, 1] (local IDs relative to unique_src_to_process_indices)
-            # This can be achieved using searchsorted if unique_src_to_process_indices is sorted.
-            # Or by building a mapping.
-
-            # Assuming unique_src_to_process_indices is sorted for searchsorted to work efficiently
-            # If not, sort it and remember the inverse permutation if original order matters for x_src_unique.
-            # For simplicity, let's assume unique_src_to_process_indices directly corresponds to the 0..N-1 order of x_src_unique.
-            # This means path_source_indices_global should already be local indices [0, num_unique_src-1]
-            # for scatter_add's `index` argument.
-            # If path_source_indices_global are still global, they need to be mapped.
-
-            # Let's refine this: `GraphModel.one_iteration` should prepare a `scatter_src_index`
-            # that directly maps paths to the 0..N-1 indices of `x_src_unique`.
-            # For this example, let's assume `path_source_indices_global` IS this scatter_index.
-            # (This means GraphModel needs to prepare it correctly based on map_src_idx_to_unique_emb_idx)
-
             if path_source_indices_global.max() >= x_src_unique.size(0):
                  print(f"Error: scatter index max {path_source_indices_global.max()} out of bounds for dim_size {x_src_unique.size(0)}")
                  # Handle error or return
@@ -1032,26 +986,31 @@ class GraphModel(nn.Module):
                  gnn_type="Stack",
                  gin_hidden_dim=None,
                  gin_num_layers=1,
-                 input_edge_dim_for_gin=108
+                 #input_edge_dim_for_gin=108
                  ):
         super(GraphModel, self).__init__()
         self.g_tensorized = preprocess_graph_to_tensors(g_nx) # Preprocess NX graph
         self.n_encoder_lookup = cui_embedding_lookup # For string CUI to embedding
-        
+        self.device = device
         # Edge encoder needs the tensorized graph's edge_to_idx for dynamic mapping
         # Or, if EdgeOneHot is modified to take graph_nx and build its own mapping:
-        self.e_encoder = EdgeOneHot(graph=g_nx) # Assumes EdgeOneHot can handle NX graph
+        self.e_encoder = EdgeOneHot(graph=g_nx, device=self.device) # Assumes EdgeOneHot can handle NX graph
         # self.edge_idx_map = self.g_tensorized['edge_to_idx'] # No longer needed if e_encoder handles it
-
+        actual_edge_dim = self.e_encoder.num_edge_types
+        
         self.p_encoder_type = path_encoder_type
         self.path_ranker_type = path_ranker_type
         
-        edge_dim = self.e_encoder.onehot_mat.shape[-1]
-
+        
+        self.edge_to_node_projection_for_transformer = None
         if self.p_encoder_type == "Transformer":
-            self.p_encoder = PathEncoderTransformer(hdim, hdim + edge_dim)
-        else:
-            self.p_encoder = PathEncoder(hdim, hdim + edge_dim)
+            self.edge_to_node_projection_for_transformer = nn.Linear(actual_edge_dim, hdim)
+            nn.init.xavier_uniform_(self.edge_to_node_projection_for_transformer.weight)
+            if self.edge_to_node_projection_for_transformer.bias is not None:
+                 nn.init.zeros_(self.edge_to_node_projection_for_transformer.bias)
+            self.p_encoder = PathEncoderTransformer(hdim, hdim + actual_edge_dim) # tgt 輸入維度不變
+        else: # MLP
+            self.p_encoder = PathEncoder(hdim, hdim + actual_edge_dim)
 
         if self.path_ranker_type == "Combo":
             self.p_ranker = TriAttnCombPathRanker(hdim)
@@ -1059,33 +1018,32 @@ class GraphModel(nn.Module):
             self.p_ranker = TriAttnFlatPathRanker(hdim)
 
         self.k_hops = num_hops
-        self.path_per_batch_size = 128
+        self.path_per_batch_size = 4096
         self.top_n = top_n
         self.cui_weights_dict = cui_weights_dict if cui_weights_dict else {}
         self.hdim = hdim # Store hdim for use
-        self.device = device
+        
         self.gnn_update = gnn_update
         self.gnn_type = gnn_type
         self.gin_num_layers = gin_num_layers if gin_num_layers else (3 if gnn_type == "Stack" else 1)
         self.gin_hidden_dim = gin_hidden_dim if gin_hidden_dim else hdim
-        self.input_edge_dim_for_gin = input_edge_dim_for_gin # Should match e_encoder output
+        #self.input_edge_dim_for_gin = input_edge_dim_for_gin # Should match e_encoder output
         if self.gnn_update:
             if self.gnn_type == "Stack":
-                # GINStack input_node_dim is hdim, output_dim_final is hdim
                 self.gnn = GINStack(
-                    input_node_dim=hdim,
-                    input_edge_dim=self.input_edge_dim_for_gin, # From e_encoder
-                    hidden_dim=self.gin_hidden_dim,
-                    output_dim_final=hdim, # GIN output should be hdim to match other embs
-                    num_layers=self.gin_num_layers,
+                    input_node_dim=hdim, 
+                    input_edge_dim=actual_edge_dim, 
+                    hidden_dim=self.gin_hidden_dim, 
+                    output_dim_final=hdim, 
+                    num_layers=self.gin_num_layers, 
                     device=device
                 )
-            else: # Single GIN layer
+            else:
                 self.gnn = NodeAggregateGIN(
-                    input_node_dim=hdim,
-                    input_edge_dim=self.input_edge_dim_for_gin,
-                    hidden_dim=self.gin_hidden_dim,
-                    output_dim=hdim, # Output should be hdim
+                    input_node_dim=hdim, 
+                    input_edge_dim=actual_edge_dim, 
+                    hidden_dim=self.gin_hidden_dim, 
+                    output_dim=hdim, 
                     device=device
                 )
         else:
@@ -1140,25 +1098,30 @@ class GraphModel(nn.Module):
         
         # 1. Retrieve 1-hop paths using tensorized function
         # prev_candidate_tensors in retrieve_... is prev_iteration_state
-        cand_src_idx_hop, cand_tgt_idx_hop, cand_edge_idx_hop, mem_orig_src_idx_hop = \
+        cand_src_idx_hop, cand_tgt_idx_hop, cand_edge_idx_hop, \
+        mem_orig_src_idx_hop, mem_first_edge_idx_hop = \
             retrieve_neighbors_paths_no_self_tensorized(
                 current_cui_str_list,
                 self.g_tensorized,
-                prev_iteration_state 
+                prev_iteration_state
             )
 
         if cand_src_idx_hop.numel() == 0: # No paths found
             return None, {}, None, True # Scores, next_hop_dict, path_tensors, mem_tensors, stop_flag
+        
+        num_paths_this_hop = cand_src_idx_hop.size(0)
 
         # --- 2. Prepare Embeddings for this Hop ---
         # Unique source and target CUI indices for this hop's paths
         unique_hop_src_indices = torch.unique(cand_src_idx_hop)
         unique_hop_tgt_indices = torch.unique(cand_tgt_idx_hop)
+        unique_mem_orig_src_indices = torch.unique(mem_orig_src_idx_hop) if mem_orig_src_idx_hop is not None else None
 
         # Get embeddings for these unique CUIs
         # These are the base embeddings before GIN (if any)
         unique_src_embs_base = self._get_embeddings_by_indices(unique_hop_src_indices)
         unique_tgt_embs = self._get_embeddings_by_indices(unique_hop_tgt_indices)
+        unique_mem_orig_src_embs = self._get_embeddings_by_indices(unique_mem_orig_src_indices) if unique_mem_orig_src_indices is not None else None
 
         if unique_src_embs_base.numel() == 0 or unique_tgt_embs.numel() == 0:
             # print(f"Debug: Failed to get base embeddings for src or tgt at hop {running_k_hop}")
@@ -1193,12 +1156,7 @@ class GraphModel(nn.Module):
         # This part is complex to tensorize fully without specific GIN assumptions.
         # We need to aggregate target+edge features for each source in unique_hop_src_indices.
         if self.gnn_update and self.gnn:
-            # Prepare inputs for GIN:
-            # x_src_unique: current_path_src_embs_for_encoding (features of unique source nodes)
-            # unique_src_to_process_indices: unique_hop_src_indices (global indices of these source nodes)
-            # path_source_indices_global_scatter: scatter_src_index_for_gin_agg (local indices for scatter)
-            # path_target_node_features: Features of target nodes for *all paths*
-            #    Need to get these from unique_tgt_embs based on cand_tgt_idx_hop
+
             map_global_tgt_idx_to_local_in_unique = {
                  glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices)
             }
@@ -1206,18 +1164,6 @@ class GraphModel(nn.Module):
                 torch.tensor([map_global_tgt_idx_to_local_in_unique[glob_idx.item()] for glob_idx in cand_tgt_idx_hop],
                              dtype=torch.long, device=self.device)
             ]
-            # path_edge_features: path_edge_embs_for_gin_and_path_enc
-
-            # Ensure edge features have the dimension expected by GIN
-            if path_edge_embs_for_gin_and_path_enc.shape[-1] != self.input_edge_dim_for_gin:
-                print(f"Warning: Edge feature dim mismatch for GIN. Got {path_edge_embs_for_gin_and_path_enc.shape[-1]}, expected {self.input_edge_dim_for_gin}. Adjusting...")
-                # This might involve padding or truncation, or re-configuring GIN's input_edge_dim
-                # For now, let's try to use it as is if GIN's edge_transform_linear can handle it,
-                # or error out, or use a subset/zeroes. This needs careful handling.
-                # A simple fix if GIN expects specific dim is to ensure e_encoder produces that.
-                # For this test, we'll assume it matches or GIN handles it.
-                # If they must match, then self.e_encoder.onehot_mat.shape[-1] must be input_edge_dim_for_gin.
-                # This is now set during GraphModel init.
 
             updated_src_embs_from_gin, _ = self.gnn(
                 current_path_src_embs_for_encoding, # x_src_unique
@@ -1228,114 +1174,275 @@ class GraphModel(nn.Module):
             )
             current_path_src_embs_for_encoding = updated_src_embs_from_gin
             # print(f"GIN updated src embs shape: {current_path_src_embs_for_encoding.shape}")
+            
+        pruning_threshold_count = 4096 # 您設定的篩選路徑數量上限
+        num_paths_this_hop_before_pruning = num_paths_this_hop # ## NOW THIS IS VALID ##
 
-        # --- 4. Prepare inputs for PathEncoder ---
-        # We need one source embedding and one (target+edge) embedding for each path in cand_src_idx_hop
+        if num_paths_this_hop > pruning_threshold_count: # Check against initial num_paths_this_hop
+            # print(f"  Hop {running_k_hop}: Path count {num_paths_this_hop} exceeds threshold {pruning_threshold_count}. Applying pruning.")
+
+            map_global_tgt_idx_to_local_in_unique = { # Ensure this map is created using pre-pruning unique_hop_tgt_indices
+                glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices)
+            }
+            # Ensure path_specific_tgt_local_indices can be created even if unique_tgt_embs was empty
+            if unique_tgt_embs.numel() > 0 :
+                path_specific_tgt_local_indices = torch.tensor(
+                    [map_global_tgt_idx_to_local_in_unique[glob_idx.item()] for glob_idx in cand_tgt_idx_hop],
+                    dtype=torch.long, device=self.device
+                )
+                path_specific_tgt_embs_for_pruning = unique_tgt_embs[path_specific_tgt_local_indices]
+
+                expanded_task_emb_for_pruning = task_emb_batch.expand(path_specific_tgt_embs_for_pruning.size(0), -1)
+                target_similarity_scores = F.cosine_similarity(path_specific_tgt_embs_for_pruning, expanded_task_emb_for_pruning, dim=1)
+                
+                # Ensure pruning_threshold_count isn't larger than available paths
+                actual_pruning_count = min(pruning_threshold_count, target_similarity_scores.size(0))
+                if actual_pruning_count > 0:
+                    _, top_k_pruning_indices = torch.topk(target_similarity_scores, actual_pruning_count)
+
+                    cand_src_idx_hop = cand_src_idx_hop[top_k_pruning_indices]
+                    cand_tgt_idx_hop = cand_tgt_idx_hop[top_k_pruning_indices]
+                    cand_edge_idx_hop = cand_edge_idx_hop[top_k_pruning_indices]
+                    if mem_orig_src_idx_hop is not None:
+                        mem_orig_src_idx_hop = mem_orig_src_idx_hop[top_k_pruning_indices]
+                    if mem_first_edge_idx_hop is not None:
+                        mem_first_edge_idx_hop = mem_first_edge_idx_hop[top_k_pruning_indices]
+                    
+                    path_edge_embs_for_gin_and_path_enc = path_edge_embs_for_gin_and_path_enc[top_k_pruning_indices]
+                    
+                    num_paths_this_hop = cand_src_idx_hop.size(0) # ## UPDATE num_paths_this_hop AFTER PRUNING ##
+                    # print(f"  Hop {running_k_hop}: Pruned from {num_paths_this_hop_before_pruning} to {num_paths_this_hop} paths.")
+                else: # No paths left after trying to select top_k (e.g. target_similarity_scores was empty)
+                    # print(f"  Hop {running_k_hop}: Pruning resulted in 0 paths to keep.")
+                    # Set all path tensors to empty
+                    cand_src_idx_hop = torch.empty(0, dtype=torch.long, device=self.device)
+                    # ... set other cand_... and mem_... tensors to empty as well ...
+                    num_paths_this_hop = 0
+
+            else: # unique_tgt_embs was empty, cannot perform similarity pruning
+                print(f"  Hop {running_k_hop}: Skipping pruning because unique_tgt_embs is empty.")
+            
+
+        # --- 5. Path Encoding and Ranking (Mini-batch loop) ---
+        # num_paths_this_hop 現在是剪枝後的數量（或原始數量，如果未達到剪枝閾值）
+        # all_path_scores_hop, all_encoded_paths_hop = [], [] # 移到迴圈前
+
+        # 準備 PathEncoder 的輸入 (src_b, combined_tgt_edge_b)
+        # 這些應基於剪枝後的 cand_src_idx_hop, cand_tgt_idx_hop, path_edge_embs_for_gin_and_path_enc
         
-        # --- PathEncoder Input Prep ---
+        # 從 current_path_src_embs_for_encoding (unique src embs 更新/未更新版) 中獲取每條剪枝後路徑的源嵌入
         path_specific_src_embs = current_path_src_embs_for_encoding[
             torch.tensor([map_global_src_idx_to_local_in_unique[idx.item()] for idx in cand_src_idx_hop],
                          dtype=torch.long, device=self.device)
         ]
         
-        map_global_tgt_idx_to_local_in_unique = { # Re-define or ensure scope
-             glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices)
+        # 從 unique_tgt_embs 中獲取每條剪枝後路徑的目標嵌入
+        # (map_global_tgt_idx_to_local_in_unique 需要在剪枝前就根據 unique_hop_tgt_indices 創建好)
+        # 這裡的 unique_hop_tgt_indices 是剪枝前的，所以 map 也應該是剪枝前的
+        # 如果剪枝了，cand_tgt_idx_hop 變短了，map_global_tgt_idx_to_local_in_unique 仍然是舊的
+        # 我們需要的是剪枝後的 unique_hop_tgt_indices 對應的 map
+        
+        # 重新構建 path_specific_tgt_embs 和 combined_tgt_edge_embs_for_path_enc
+        # 基於剪枝後的 cand_tgt_idx_hop 和 path_edge_embs_for_gin_and_path_enc
+        
+        # 獲取剪枝後路徑的目標節點的局部索引 (相對於 unique_tgt_embs)
+        # unique_tgt_embs 是在剪枝前計算的，所以 map_global_tgt_idx_to_local_in_unique 仍然有效
+        _map_global_tgt_idx_to_local_in_unique_for_encoding = {
+            glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices) # 使用剪枝前的 unique_hop_tgt_indices
         }
-        path_specific_tgt_embs = unique_tgt_embs[
-            torch.tensor([map_global_tgt_idx_to_local_in_unique[idx.item()] for idx in cand_tgt_idx_hop],
+        path_specific_tgt_embs_for_encoding = unique_tgt_embs[
+            torch.tensor([_map_global_tgt_idx_to_local_in_unique_for_encoding[idx.item()] for idx in cand_tgt_idx_hop], # 使用剪枝後的 cand_tgt_idx_hop
                          dtype=torch.long, device=self.device)
         ]
         
-        # Combined (target + edge) embeddings for PathEncoder input
-        # path_edge_embs is already [num_paths, edge_dim]
-        # path_specific_tgt_embs is [num_paths, hdim]
-        # Ensure dimensions are broadcastable or correctly concatenated.
-        # PathEncoder expects tgt_input_dim = hdim + edge_dim.
-        try:
-            combined_tgt_edge_embs_for_path_enc = torch.cat(
-                (path_specific_tgt_embs, path_edge_embs_for_gin_and_path_enc), dim=-1
-            )
-        except RuntimeError as e:
-            print(f"Error PathEnc concat: {e}, tgt_shape: {path_specific_tgt_embs.shape}, edge_shape: {path_edge_embs_for_gin_and_path_enc.shape}")
-            return None, {}, None, None, True
+        # path_edge_embs_for_gin_and_path_enc 已經在步驟 4d 被剪枝了
+        combined_tgt_edge_embs_for_path_enc = torch.cat(
+            (path_specific_tgt_embs_for_encoding, path_edge_embs_for_gin_and_path_enc), dim=-1
+        )
 
-
-        # --- 5. Path Encoding and Ranking ---
-        num_paths_this_hop = cand_src_idx_hop.size(0)
-        all_path_scores_hop, all_encoded_paths_hop = [], []
-
+        # mini-batch 迴圈現在處理的是剪枝後的路徑
+        all_path_scores_hop, all_encoded_paths_hop = [], [] # 重置
         for i in range(0, num_paths_this_hop, self.path_per_batch_size):
             s_ = slice(i, min(i + self.path_per_batch_size, num_paths_this_hop))
-            src_b, combined_tgt_edge_b = path_specific_src_embs[s_], combined_tgt_edge_embs_for_path_enc[s_]
             
-            encoded_b = self.p_encoder(src_b, combined_tgt_edge_b)
+            # --- Transformer 輸入序列構建 (如果 path_encoder_type == "Transformer") ---
+            # 這部分邏輯需要使用剪枝後的索引和嵌入
+            # mem_orig_src_idx_hop, mem_first_edge_idx_hop, cand_src_idx_hop 都已被剪枝
+            # unique_mem_orig_src_embs, current_path_src_embs_for_encoding (源於 unique_src_embs_base) 仍是基於剪枝前的 unique 索引
+            # 所以在構建序列時，需要小心地使用這些映射
+            
+            if self.p_encoder_type == "Transformer":
+                src_sequences_for_transformer = []
+                # 映射：全局索引 -> 在 unique 張量中的局部索引 (這些 map 基於剪枝前的 unique 索引)
+                _map_mem_orig_to_local = {glob_idx.item(): local_idx for local_idx, glob_idx in enumerate(unique_mem_orig_src_indices)} if unique_mem_orig_src_indices is not None else {}
+                _map_curr_src_to_local_for_transformer = map_global_src_idx_to_local_in_unique # 基於剪枝前的 unique_hop_src_indices
+
+                for j_path_idx_in_batch in range(s_.start, s_.stop): # j_path_idx_in_batch 是剪枝後路徑列表的索引
+                    path_elements_embs = []
+                    
+                    # 1. 添加最初始源節點嵌入 (CUI_A)
+                    # mem_orig_src_idx_hop 此時是剪枝後的張量
+                    orig_src_idx_val = mem_orig_src_idx_hop[j_path_idx_in_batch].item() if mem_orig_src_idx_hop is not None else -1
+                    if orig_src_idx_val != -1 and orig_src_idx_val in _map_mem_orig_to_local and unique_mem_orig_src_embs is not None:
+                        path_elements_embs.append(unique_mem_orig_src_embs[_map_mem_orig_to_local[orig_src_idx_val]])
+                    else: 
+                        # cand_src_idx_hop 此時是剪枝後的張量
+                        curr_src_idx_val_for_fallback = cand_src_idx_hop[j_path_idx_in_batch].item()
+                        if curr_src_idx_val_for_fallback in _map_curr_src_to_local_for_transformer :
+                             path_elements_embs.append(current_path_src_embs_for_encoding[_map_curr_src_to_local_for_transformer[curr_src_idx_val_for_fallback]])
+
+                    # 2. 添加第一個關係的嵌入 (Rel1) - 僅當是第二跳且 Rel1 存在時
+                    if running_k_hop == 1 and mem_first_edge_idx_hop is not None:
+                        # mem_first_edge_idx_hop 此時是剪枝後的張量
+                        first_edge_idx_val = mem_first_edge_idx_hop[j_path_idx_in_batch].item()
+                        if first_edge_idx_val != -1: 
+                            if first_edge_idx_val < self.e_encoder.onehot_mat.shape[0]:
+                                first_rel_one_hot = self.e_encoder.onehot_mat[first_edge_idx_val].to(self.device)
+                                projected_first_rel_emb = self.edge_to_node_projection_for_transformer(first_rel_one_hot)
+                                path_elements_embs.append(projected_first_rel_emb)
+                            else: # 索引越界
+                                path_elements_embs.append(torch.zeros(self.hdim, device=self.device))
+                    
+                    # 3. 添加中間節點嵌入 (CUI_B) - 僅當是第二跳且與最初始源節點不同時
+                    # cand_src_idx_hop 此時是剪枝後的張量
+                    curr_src_idx_val = cand_src_idx_hop[j_path_idx_in_batch].item()
+                    if running_k_hop == 1 and orig_src_idx_val != -1 and orig_src_idx_val != curr_src_idx_val:
+                         if curr_src_idx_val in _map_curr_src_to_local_for_transformer:
+                            path_elements_embs.append(current_path_src_embs_for_encoding[_map_curr_src_to_local_for_transformer[curr_src_idx_val]])
+                    
+                    if path_elements_embs:
+                        src_sequences_for_transformer.append(torch.stack(path_elements_embs))
+                    else:
+                        src_sequences_for_transformer.append(torch.zeros((1, self.hdim), device=self.device))
+
+                if not src_sequences_for_transformer:
+                     src_b = torch.empty(0,0,self.hdim, device=self.device) 
+                else:
+                    src_b = pad_sequence(src_sequences_for_transformer, batch_first=True, padding_value=0.0)
+            else: # MLP Encoder Logic
+                # path_specific_src_embs 已經在剪枝後、迴圈前準備好了
+                src_b = path_specific_src_embs[s_]
+            
+            # combined_tgt_edge_embs_for_path_enc 也已經在剪枝後、迴圈前準備好了
+            combined_tgt_edge_b = combined_tgt_edge_embs_for_path_enc[s_]
+
+            # --- 後續的編碼與排序邏輯 ---
+            # 準備 combined_tgt_edge_b (這部分需要小心，確保索引 s_ 的應用正確)
+            map_global_tgt_idx_to_local_in_unique = {glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices)}
+            
+            # cand_tgt_idx_hop[s_] 獲取當前 mini-batch 對應的目標節點的全局索引
+            current_batch_tgt_global_indices = cand_tgt_idx_hop[s_]
+            # 將這些全局索引轉換為在 unique_tgt_embs 中的局部索引
+            current_batch_tgt_local_indices = torch.tensor(
+                [map_global_tgt_idx_to_local_in_unique[idx.item()] for idx in current_batch_tgt_global_indices],
+                dtype=torch.long, device=self.device
+            )
+            path_specific_tgt_embs_for_batch = unique_tgt_embs[current_batch_tgt_local_indices]
+            
+            combined_tgt_edge_b = torch.cat(
+                (path_specific_tgt_embs_for_batch, path_edge_embs_for_gin_and_path_enc[s_]), dim=-1
+            )
+
+            if src_b.numel() == 0 or src_b.shape[0] == 0:
+                continue
+
+            encoded_b = self.p_encoder(src_b, combined_tgt_edge_b) # src_b現在是序列, tgt是組合
             if self.p_encoder_type == "Transformer" and encoded_b.dim() == 3:
-                encoded_b = encoded_b.squeeze(1)
+                 # Transformer 的輸出通常是 (batch, seq_len, feature_dim)
+                 # 我們需要決定如何從序列輸出中得到單個路徑嵌入
+                 # 例如，取序列的第一個token ([CLS]) 的輸出，或對所有token輸出取平均
+                 # 假設 PathEncoderTransformer 的輸出已經處理好了，是 [batch_size_path_encoder, hdim]
+                 # 如果 PathEncoderTransformer.forward 返回的是 (batch, seq_len, hdim)
+                 # 而下游 p_ranker 期望 (batch, hdim)，則需要調整
+                 # 原始 DR.KNOWS 的 nn.Transformer(batch_first=True) 用於 encoder-decoder 時，
+                 # encoder輸出(memory)是(N,S,E), decoder輸出是(N,T,E)
+                 # 這裡 self.p_encoder(src, htgt), htgt 的 seq_len 是 1.
+                 # 所以輸出 hpath 的 seq_len 也可能是 1, squeeze(1) 是合理的
+                if encoded_b.shape[1] == 1: # 如果序列長度為1
+                    encoded_b = encoded_b.squeeze(1)
+                else: # 如果序列長度不為1, 例如TransformerEncoder的輸出
+                      # 我們可能取第一個元素的表示 (類似CLS)
+                    encoded_b = encoded_b[:, 0, :] 
+
+
             all_encoded_paths_hop.append(encoded_b)
-            
+
             task_exp_b = task_emb_batch.expand(encoded_b.size(0), -1)
             ctx_exp_b = context_emb_batch.expand(encoded_b.size(0), -1) if context_emb_batch is not None else task_exp_b
             scores_b = self.p_ranker(task_exp_b, ctx_exp_b, encoded_b)
             all_path_scores_hop.append(scores_b)
 
-        if not all_path_scores_hop: return None, {}, None, None, True
+        if not all_path_scores_hop:
+             return None, {}, None, True
+
         final_scores_hop = torch.cat(all_path_scores_hop, dim=0)
         encoded_paths_tensor_hop = torch.cat(all_encoded_paths_hop, dim=0)
 
-        # --- 6. Top-N Selection ---
         top_n_val = min(self.top_n, final_scores_hop.size(0))
-        if top_n_val == 0: return None, {}, None, None, True # No paths to select if final_scores_hop is empty
-        
-        _, top_k_indices = torch.topk(final_scores_hop.squeeze(-1), top_n_val, dim=0)
-        
-        sel_tgt_idx = cand_tgt_idx_hop[top_k_indices]
-        sel_src_idx_thishop = cand_src_idx_hop[top_k_indices] # For debug/path string
-        sel_edge_idx = cand_edge_idx_hop[top_k_indices] # For debug/path string
-        sel_mem_orig_src_idx = mem_orig_src_idx_hop[top_k_indices] if mem_orig_src_idx_hop is not None else None
+        if top_n_val == 0: return None, {}, None, True
 
-        all_paths_info = {"scores": final_scores_hop, "encoded_embeddings": encoded_paths_tensor_hop,
-                          "src_idx": cand_src_idx_hop, "tgt_idx": cand_tgt_idx_hop,
-                          "edge_idx": cand_edge_idx_hop, "mem_orig_src_idx": mem_orig_src_idx_hop}
-        next_hop_state = {"selected_src_orig_idx": sel_mem_orig_src_idx,
-                          "selected_hop_target_idx": sel_tgt_idx}
+        _, top_k_indices = torch.topk(final_scores_hop.squeeze(-1), top_n_val, dim=0)
+
+        sel_tgt_idx = cand_tgt_idx_hop[top_k_indices]
+        sel_mem_orig_src_idx = mem_orig_src_idx_hop[top_k_indices] if mem_orig_src_idx_hop is not None else None
+        sel_edge_idx_thishop = cand_edge_idx_hop[top_k_indices] # 當前這一跳選出的邊 (Rel2 for 2-hop)
+
+        all_paths_info = {
+            "scores": final_scores_hop, "encoded_embeddings": encoded_paths_tensor_hop,
+            "src_idx": cand_src_idx_hop, "tgt_idx": cand_tgt_idx_hop,
+            "edge_idx": cand_edge_idx_hop, 
+            "mem_orig_src_idx": mem_orig_src_idx_hop,
+            "mem_first_edge_idx": mem_first_edge_idx_hop
+        }
         
-        # Path string construction (for debug, CPU-bound)
+        next_hop_state = {
+            "selected_src_orig_idx": sel_mem_orig_src_idx,
+            "selected_hop_target_idx": sel_tgt_idx,
+        }
+        if running_k_hop == 0:
+            next_hop_state["selected_first_hop_edge_idx"] = sel_edge_idx_thishop
+        elif prev_iteration_state and "selected_first_hop_edge_idx" in prev_iteration_state:
+            if mem_first_edge_idx_hop is not None:
+                # 確保 mem_first_edge_idx_hop 的長度與 top_k_indices 的數量一致
+                # 這在 retrieve_neighbors 中已經被 non_self_loop_mask 篩選過了
+                if mem_first_edge_idx_hop.size(0) == cand_src_idx_hop.size(0): # cand_src_idx_hop 是篩選前的
+                    next_hop_state["selected_first_hop_edge_idx"] = mem_first_edge_idx_hop[top_k_indices]
+                else: # 如果長度不一致，這是一個潛在的問題
+                    print(f"Warning: Length mismatch for mem_first_edge_idx_hop in next_hop_state. Size: {mem_first_edge_idx_hop.size(0)}, TopK indices num: {top_k_indices.numel()}")
+                    # 作為回退，可以不設置，或者設置為 None/特殊值
+                    next_hop_state["selected_first_hop_edge_idx"] = None 
+            else:
+                 next_hop_state["selected_first_hop_edge_idx"] = None
+
+
         visited_paths_str_dict = {}
-        # idx_to_cui = self.g_tensorized['idx_to_cui'] # Already defined
-        # idx_to_edge = self.g_tensorized['idx_to_edge']
-        # for i in range(sel_tgt_idx.size(0)):
-        #     tgt_s = idx_to_cui.get(sel_tgt_idx[i].item())
-        #     src_s = idx_to_cui.get(sel_src_idx_thishop[i].item()) # Src of current hop path
-        #     edge_s = idx_to_edge.get(sel_edge_idx[i].item())
-        #     if tgt_s: visited_paths_str_dict[tgt_s] = f"... -> {src_s} --({edge_s})--> {tgt_s}"
-        
         return all_paths_info, visited_paths_str_dict, next_hop_state, stop_flag
 
 
 class Trainer(nn.Module):
     def __init__(self, tokenizer,
-                 encoder, # Base encoder like SapBERT
-                 g_nx, # NetworkX graph FOR GraphModel's preprocessing
-                 cui_embedding_lookup, # Initialized CuiEmbedding object (string lookup)
+                 encoder, 
+                 g_nx, 
+                 cui_embedding_lookup, 
                  hdim,
-                 nums_of_head, # For original PathRanker, may not be used by TriAttn
-                 cui_vocab_str_to_idx, # IMPORTANT: CUI string to GLOBAL CUI INDEX mapping
-                 top_n,
+                 nums_of_head, 
+                 cui_vocab_str_to_idx, 
+                 top_n, # top_n 仍然用於 GraphModel 內部決定下一跳的探索寬度
                  device,
                  nums_of_epochs,
                  LR,
-                 cui_weights_dict=None, # Dict: CUI_str -> weight
+                 cui_weights_dict=None,
                  contrastive_learning=True,
                  save_model_path=None,
                  gnn_update=True,
-                 intermediate=False, # Calculate loss on intermediate hops?
+                 intermediate=False, 
+                 score_threshold=0.5, # ## ADDED: 評分閾值
                  distance_metric="Cosine",
                  path_encoder_type="MLP",
                  path_ranker_type="Flat",
                  gnn_type="Stack",
-                 gin_hidden_dim=None, # Pass to GraphModel
-                 gin_num_layers=1,    # Pass to GraphModel
-                 input_edge_dim_for_gin=108, # Pass to GraphModel
+                 gin_hidden_dim=None,
+                 gin_num_layers=1,
                  triplet_margin=1.0,
                  early_stopping_patience=3,
                  early_stopping_metric='val_loss',
@@ -1345,19 +1452,19 @@ class Trainer(nn.Module):
 
         self.tokenizer = tokenizer
         self.encoder = encoder
-        self.k_hops = 2 # Max hops fixed at 2
+        self.k_hops = 2 
         self.device = device
-        self.cui_vocab_str_to_idx = cui_vocab_str_to_idx # Store this mapping
+        self.cui_vocab_str_to_idx = cui_vocab_str_to_idx 
         self.rev_cui_vocab_idx_to_str = {v: k for k, v in cui_vocab_str_to_idx.items()}
-
+        self.top_n_for_exploration = top_n # ## RENAMED for clarity
 
         self.gmodel = GraphModel(
-            g_nx=g_nx, # Pass the NetworkX graph
+            g_nx=g_nx, 
             cui_embedding_lookup=cui_embedding_lookup,
             hdim=hdim,
             nums_of_head=nums_of_head,
-            num_hops=self.k_hops,
-            top_n=top_n,
+            num_hops=self.k_hops, # GraphModel 內部可能不需要這個num_hops了，因為Trainer控制跳數
+            top_n=self.top_n_for_exploration, # GraphModel 用 top_n 決定下一跳的起始節點
             device=device,
             cui_weights_dict=cui_weights_dict,
             gnn_update=gnn_update,
@@ -1365,12 +1472,11 @@ class Trainer(nn.Module):
             path_ranker_type=path_ranker_type,
             gnn_type=gnn_type,
             gin_hidden_dim=gin_hidden_dim,
-            gin_num_layers=gin_num_layers,
-            input_edge_dim_for_gin=input_edge_dim_for_gin
+            gin_num_layers=gin_num_layers
         )
 
         self.encoder.to(device)
-        self.gmodel.to(device) # GraphModel's __init__ should also move its submodules
+        self.gmodel.to(device)
 
         self.LR = LR
         self.adam_epsilon = 1e-8
@@ -1382,10 +1488,11 @@ class Trainer(nn.Module):
         self.mode = 'train'
         self.contrastive_learning = contrastive_learning
         self.triplet_margin = triplet_margin
+        self.score_threshold = score_threshold # ## ADDED
 
         self.loss_fn_bce = nn.BCEWithLogitsLoss()
         self.save_model_path = save_model_path
-
+        
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_metric = early_stopping_metric.lower()
         self.early_stopping_delta = early_stopping_delta
@@ -1393,13 +1500,21 @@ class Trainer(nn.Module):
         self.early_stop = False
         if self.early_stopping_metric == 'val_loss':
             self.best_metric_val = float('inf')
-        elif self.early_stopping_metric == 'val_acc':
+        elif self.early_stopping_metric == 'val_acc': # 假設我們會有一個主要的 acc 指標
             self.best_metric_val = float('-inf')
-        else:
-            raise ValueError("early_stopping_metric 必須是 'val_loss' 或 'val_acc'")
+        else: # 默認 val_loss
+            self.best_metric_val = float('inf')
+            print(f"Warning: early_stopping_metric '{early_stopping_metric}' not recognized. Defaulting to 'val_loss'.")
 
-        print("**** ============= TRAINER (MediQ Tensorized GModel) ============= **** ")
-        # ... (exp_setting logging) ...
+
+        print("**** ============= TRAINER (MediQ Tensorized GModel with Thresholding) ============= **** ")
+        exp_setting = (f"TRAINER SETUP: SCORE_THRESHOLD: {self.score_threshold}\n"
+                       f"INTERMEDIATE LOSS SUPERVISION: {self.intermediate}\n"
+                       f"CONTRASTIVE LEARNING: {self.contrastive_learning}\n"
+                       # ... (可以加入更多超參數到日誌中)
+                      )
+        logging.info(exp_setting)
+        print(exp_setting)
         self.optimizer = None
 
     def create_optimizers(self):
@@ -1558,129 +1673,223 @@ class Trainer(nn.Module):
 
     def forward_per_batch(self, batch):
         input_text_tks_padded = batch['input_text_tks_padded']
-        known_cuis_str_batch = batch['known_cuis'] # List of lists of CUI strings
+        known_cuis_str_batch = batch['known_cuis'] 
         hop1_target_cuis_str_batch = batch['hop1_target_cuis']
         hop2_target_cuis_str_batch = batch['hop2_target_cuis']
+        intermediate_target_cuis_batch = batch['intermediate_target_cuis'] # 新增的GT
 
         input_task_embs_batch = self.encoder(
             input_text_tks_padded['input_ids'].to(self.device),
             input_text_tks_padded['attention_mask'].to(self.device)
-        ).pooler_output # [batch_size, hdim]
+        ).pooler_output 
 
         accumulated_batch_loss = torch.tensor(0.0, device=self.device)
         batch_size = input_task_embs_batch.shape[0]
-        final_predicted_cuis_global_idx_batch = [torch.empty(0, dtype=torch.long, device=self.device) for _ in range(batch_size)]
+        
+        # ## MODIFIED: 用於存儲最終預測結果 (包含完整路徑信息)
+        # 結構: batch_final_predictions[sample_idx] = { "path_tuple_str": "CUI_A->Rel1->CUI_B->Rel2->CUI_C", "final_target_cui": "CUI_C", "score": score, "hop": 2 }
+        # 或者更簡單: batch_final_predictions[sample_idx] = [{"target": CUI_str, "hop": N, "score": S, "full_path_indices": (orig_s, r1, inter_s, r2, final_t)}]
+        batch_final_predictions_for_acc = [[] for _ in range(batch_size)] 
+        # 用於評估1跳的準確性
+        batch_hop1_predictions_for_acc = [[] for _ in range(batch_size)] 
 
-
-        for i in range(batch_size):
+        for i in range(batch_size): # Sample 迴圈
             sample_loss_this_item = torch.tensor(0.0, device=self.device)
-            task_emb_sample = input_task_embs_batch[i].unsqueeze(0) # [1, hdim]
+            task_emb_sample = input_task_embs_batch[i].unsqueeze(0) 
             known_cuis_str_sample = known_cuis_str_batch[i]
-            
             context_emb_sample = self.compute_context_embedding(known_cuis_str_sample)
-            if context_emb_sample is None: # Fallback if no known CUIs have embeddings
-                context_emb_sample = task_emb_sample # Use task embedding as context
+            if context_emb_sample is None: context_emb_sample = task_emb_sample
 
-            # Initial state for multi-hop for this sample
             current_cui_str_list_for_hop = known_cuis_str_sample
-            prev_iter_state_for_next_hop = None # For the first hop
+            prev_iter_state_for_next_hop = None
             
-            # Store selected target CUIs (global indices) after the last successful hop for this sample
-            last_hop_selected_target_cuis_idx = torch.empty(0, dtype=torch.long, device=self.device)
+            # ## ADDED: 儲存當前樣本每一跳超過閾值的路徑信息
+            # 格式: { path_tuple_key: {"target_idx": CUI_idx, "score": float, "hop": int, "path_indices": tuple} }
+            # path_tuple_key 可以是 (orig_src_idx, first_edge_idx, intermediate_idx, second_edge_idx, final_target_idx)
+            # 或簡化為 (orig_src_idx, intermediate_idx_or_final_target_idx) for 1-hop
+            # (orig_src_idx, intermediate_idx, final_target_idx) for 2-hop
+            # 為了路徑取代，我們需要能唯一識別路徑並追蹤其組成
+            # 結構: high_confidence_paths_sample[hop_num] = list of dicts
+            # dict = {"orig_src_idx": tensor, "first_edge_idx": tensor (or -1), "inter_or_final_tgt_idx": tensor, "final_tgt_idx": tensor (for 2hop), "score": tensor, "hop_num": int}
+            
+            # 簡化：只儲存用於下一跳探索的 top_n 節點的詳細信息
+            # 和一個用於最終預測的、基於閾值的候選列表
+            
+            # 儲存每一跳超過閾值的 (最初始源頭CUI, 最終目標CUI, 跳數, 完整路徑元組(索引), 分數)
+            # full_path_indices: (orig_s_idx, r1_idx, inter_s_idx, r2_idx, final_t_idx)
+            # 對於1-hop: (orig_s_idx, r1_idx, final_t_idx, -1, -1)
+            # 這裡的 key 可以是最終目標CUI，value是包含路徑和分數的字典，以處理多個路徑指向同一目標
+            # 但為了路徑取代，我們需要以 "最初始源頭->中間節點" 作為鍵
+            
+            # 最終預測集合，key: (orig_src_idx, first_hop_target_idx), value: {"path": path_tuple, "score": score, "hop": 1 or 2}
+            current_sample_final_preds_dict = {}
 
 
-            for running_k in range(self.k_hops): # 0, 1 for k_hops=2
-                if not current_cui_str_list_for_hop and running_k > 0 : # Stop if no nodes to expand from previous hop
-                    break
+            for running_k in range(self.k_hops): # Hop 迴圈
+                if not current_cui_str_list_for_hop and running_k > 0 : break
                 
-                all_paths_info_hop, visited_next_hop_str_dict_hop, \
-                next_hop_state_info_hop, stop_flag = self.gmodel.one_iteration(
-                    task_emb_batch=task_emb_sample,
-                    current_cui_str_list=current_cui_str_list_for_hop,
-                    running_k_hop=running_k,
-                    context_emb_batch=context_emb_sample,
-                    prev_iteration_state=prev_iter_state_for_next_hop
+                all_paths_info_hop, _, \
+                next_hop_state_info_for_exploration, stop_flag = self.gmodel.one_iteration(
+                    task_emb_sample, current_cui_str_list_for_hop, running_k,
+                    context_emb_sample, prev_iter_state_for_next_hop
                 )
 
-                if stop_flag or all_paths_info_hop is None:
-                    print(f"  Sample {i}, Hop {running_k}: Stopped or no path info.")
-                    break # Stop iteration for this sample if no paths or error
+                if stop_flag or all_paths_info_hop is None: break
 
-                # Determine Ground Truth CUI strings for this hop
-                gt_cuis_str_list_this_hop = hop1_target_cuis_str_batch[i] if running_k == 0 else hop2_target_cuis_str_batch[i]
+                # --- 損失計算 (GT選取邏輯已更新) ---
+                gt_cuis_str_list_this_hop = []
+                if running_k == 0:
+                    gt_cuis_str_list_this_hop.extend(hop1_target_cuis_str_batch[i])
+                    if self.intermediate:
+                        gt_cuis_str_list_this_hop.extend(intermediate_target_cuis_batch[i])
+                elif running_k == 1:
+                    gt_cuis_str_list_this_hop.extend(hop2_target_cuis_str_batch[i])
+                gt_cuis_str_list_this_hop = list(set(gt_cuis_str_list_this_hop))
 
-                # Calculate Loss for this hop
-                hop_bce_loss = self.compute_bce_loss_for_hop(all_paths_info_hop, gt_cuis_str_list_this_hop)
-                hop_triplet_loss = torch.tensor(0.0, device=self.device)
-                if self.contrastive_learning and self.mode == "train":
-                    # Construct anchor: e.g., combination of task and context
-                    # For simplicity, let's use task_emb_sample as anchor.
-                    # A better anchor might involve embeddings of the source CUIs of this hop.
-                    anchor_for_triplet = task_emb_sample 
-                    hop_triplet_loss = self.compute_triplet_loss_for_hop(
-                        anchor_for_triplet, all_paths_info_hop, gt_cuis_str_list_this_hop
-                    )
+                current_hop_bce_loss = torch.tensor(0.0, device=self.device)
+                current_hop_triplet_loss = torch.tensor(0.0, device=self.device)
+                if gt_cuis_str_list_this_hop and all_paths_info_hop.get('scores') is not None and all_paths_info_hop['scores'].numel() > 0:
+                    current_hop_bce_loss = self.compute_bce_loss_for_hop(all_paths_info_hop, gt_cuis_str_list_this_hop)
+                    if self.contrastive_learning and self.mode == "train" and \
+                       all_paths_info_hop.get('encoded_embeddings') is not None and all_paths_info_hop['encoded_embeddings'].numel() > 0:
+                        anchor_for_triplet = task_emb_sample
+                        current_hop_triplet_loss = self.compute_triplet_loss_for_hop(
+                            anchor_for_triplet, all_paths_info_hop, gt_cuis_str_list_this_hop
+                        )
+                current_hop_total_loss = current_hop_bce_loss + current_hop_triplet_loss
+                sample_loss_this_item = sample_loss_this_item + current_hop_total_loss
                 
-                current_hop_total_loss = hop_bce_loss + hop_triplet_loss
+                # --- ## MODIFIED: 基於閾值篩選高質量預測，並執行路徑取代 ---
+                path_scores = all_paths_info_hop['scores'].squeeze(-1) # [num_paths]
+                confident_mask = (path_scores >= self.score_threshold)
                 
-                #---debug---
-                print(f"  Sample {i}, Hop {running_k}:")
-                print(f"    Start CUIs: {current_cui_str_list_for_hop[:5] if current_cui_str_list_for_hop else 'None'}")
-                print(f"    GT CUIs: {gt_cuis_str_list_this_hop[:5] if gt_cuis_str_list_this_hop else 'None'}")
-                if all_paths_info_hop:
-                    print(f"    Path Scores numel: {all_paths_info_hop['scores'].numel() if all_paths_info_hop['scores'] is not None else 'None'}")
-                    print(f"    Path Tgt Idx numel: {all_paths_info_hop['tgt_idx'].numel() if all_paths_info_hop['tgt_idx'] is not None else 'None'}")
-                else:
-                    print(f"    all_paths_info_hop is None.")
-                print(f"    BCE Loss: {hop_bce_loss.item():.4f}, Triplet Loss: {hop_triplet_loss.item():.4f}")
-                print(f"    Hop Total Loss: {current_hop_total_loss.item():.4f}, Requires Grad: {current_hop_total_loss.requires_grad}, Grad Fn: {current_hop_total_loss.grad_fn}")
-                #---debug---
-                
-                
+                confident_path_indices = torch.where(confident_mask)[0]
 
-                if running_k == 0 and self.intermediate:
-                    sample_loss_this_item = sample_loss_this_item + current_hop_total_loss
-                if running_k == self.k_hops - 1: # Always include final hop loss
-                    sample_loss_this_item = sample_loss_this_item + current_hop_total_loss
+                if confident_path_indices.numel() > 0:
+                    conf_orig_srcs = all_paths_info_hop['mem_orig_src_idx'][confident_path_indices]
+                    conf_first_edges = all_paths_info_hop['mem_first_edge_idx'][confident_path_indices] if all_paths_info_hop['mem_first_edge_idx'] is not None else None
+                    conf_hop_srcs = all_paths_info_hop['src_idx'][confident_path_indices] # 當前跳的源 (中間節點 for hop2)
+                    conf_hop_edges = all_paths_info_hop['edge_idx'][confident_path_indices] # 當前跳的邊 (Rel2 for hop2)
+                    conf_hop_tgts = all_paths_info_hop['tgt_idx'][confident_path_indices]   # 當前跳的目標 (最終目標 for hop2)
+                    conf_scores = path_scores[confident_path_indices]
+
+                    for k_path in range(confident_path_indices.numel()):
+                        orig_s_idx = conf_orig_srcs[k_path].item()
+                        inter_s_idx = conf_hop_srcs[k_path].item() # 中間節點 (如果是第二跳) 或最終目標 (如果是第一跳的源)
+                        final_t_idx = conf_hop_tgts[k_path].item()
+                        current_score = conf_scores[k_path].item()
+                        
+                        r1_idx = conf_first_edges[k_path].item() if conf_first_edges is not None and conf_first_edges[k_path].item() != -1 else -1
+                        r2_idx = conf_hop_edges[k_path].item() # 當前跳的邊
+
+                        if running_k == 0: # 處理第一跳的高質量預測
+                            # 路徑是: orig_s --r2(當前邊)--> final_t
+                            path_key = (orig_s_idx, final_t_idx) # 用 (最初始源, 1跳目標) 作為鍵
+                            # full_path_tuple = (orig_s_idx, r2_idx, final_t_idx, -1, -1) # Rel1, Inter, Rel2, Final
+                            # 這裡 orig_s_idx == inter_s_idx， r1_idx == -1
+                            full_path_tuple_for_pred = (orig_s_idx, r2_idx, final_t_idx)
+
+
+                            # 記錄用於1-hop accuracy計算的目標
+                            batch_hop1_predictions_for_acc[i].append(self.rev_cui_vocab_idx_to_str.get(final_t_idx))
+                            
+                            if path_key not in current_sample_final_preds_dict or \
+                               current_score > current_sample_final_preds_dict[path_key]['score']:
+                                current_sample_final_preds_dict[path_key] = {
+                                    "path_tuple_indices": full_path_tuple_for_pred,
+                                    "score": current_score,
+                                    "hop": 1,
+                                    "final_target_idx": final_t_idx
+                                }
+                        elif running_k == 1: # 處理第二跳的高質量預測
+                            # 路徑是: orig_s --r1--> inter_s --r2--> final_t
+                            first_hop_key = (orig_s_idx, inter_s_idx) # 檢查這個1-hop路徑是否已存在
+                            full_path_tuple_for_pred = (orig_s_idx, r1_idx, inter_s_idx, r2_idx, final_t_idx)
+
+                            # 如果這個2-hop路徑的1-hop部分已經是一個高質量預測，
+                            # 且當前2-hop路徑分數更高，則取代；或者如果1-hop部分不是高質量預測，則直接添加2-hop。
+                            # (簡化邏輯: 如果存在對應的1-hop，且新2-hop更好，則取代。否則，考慮作為新路徑添加)
+                            
+                            # 優先2-hop路徑
+                            # 我們用 (orig_s, inter_s) 作為key來查找是否可以被取代的1-hop路徑
+                            # 或者，如果我們用 (orig_s, final_t) for 1-hop / (orig_s, inter_s, final_t) for 2-hop as key for uniqueness
+                            # 這裡的邏輯是：如果一個 (orig_s, inter_s) 的1-hop路徑存在，現在有一個從它擴展的2-hop路徑，則取代。
+                            
+                            if first_hop_key in current_sample_final_preds_dict and \
+                               current_sample_final_preds_dict[first_hop_key]['hop'] == 1:
+                                # 發現了可以被擴展的1-hop路徑，用當前的2-hop路徑取代它
+                                # (如果分數更高，或者無條件取代更長的路徑)
+                                # 這裡我們無條件用更長的路徑取代，並更新分數
+                                del current_sample_final_preds_dict[first_hop_key] # 刪除舊的1-hop
+                                # 新的鍵可以用 (orig_s, final_t) 加上 hop=2 標記，或者用完整的 (orig_s, inter_s, final_t)
+                                # 為了唯一性，我們用 (orig_s, inter_s, final_t) 作为2-hop的key
+                                two_hop_path_key = (orig_s_idx, inter_s_idx, final_t_idx)
+                                current_sample_final_preds_dict[two_hop_path_key] = {
+                                     "path_tuple_indices": full_path_tuple_for_pred,
+                                     "score": current_score,
+                                     "hop": 2,
+                                     "final_target_idx": final_t_idx
+                                }
+                            else:
+                                # 沒有可取代的1-hop路徑，或者 first_hop_key 已經是個2-hop路徑
+                                # 將此2-hop路徑作為一個新的獨立預測加入（如果鍵不存在或分數更高）
+                                two_hop_path_key = (orig_s_idx, inter_s_idx, final_t_idx) # 確保key的唯一性
+                                if two_hop_path_key not in current_sample_final_preds_dict or \
+                                   current_score > current_sample_final_preds_dict[two_hop_path_key]['score']:
+                                    current_sample_final_preds_dict[two_hop_path_key] = {
+                                        "path_tuple_indices": full_path_tuple_for_pred,
+                                        "score": current_score,
+                                        "hop": 2,
+                                        "final_target_idx": final_t_idx
+                                    }
                 
-                # Update state for the next iteration
-                if next_hop_state_info_hop and next_hop_state_info_hop['selected_hop_target_idx'] is not None:
-                    last_hop_selected_target_cuis_idx = next_hop_state_info_hop['selected_hop_target_idx']
+                # --- 更新下一跳的狀態 (仍然基於 top_n 進行探索) ---
+                if next_hop_state_info_for_exploration and \
+                   next_hop_state_info_for_exploration['selected_hop_target_idx'] is not None and \
+                   next_hop_state_info_for_exploration['selected_hop_target_idx'].numel() > 0 :
+                    
                     current_cui_str_list_for_hop = [
                         self.rev_cui_vocab_idx_to_str.get(idx.item()) 
-                        for idx in last_hop_selected_target_cuis_idx
-                        if self.rev_cui_vocab_idx_to_str.get(idx.item()) is not None # Filter out Nones
+                        for idx in next_hop_state_info_for_exploration['selected_hop_target_idx']
+                        if self.rev_cui_vocab_idx_to_str.get(idx.item()) is not None 
                     ]
-                    prev_iter_state_for_next_hop = next_hop_state_info_hop 
-                else: # No valid targets selected for next hop
+                    prev_iter_state_for_next_hop = next_hop_state_info_for_exploration 
+                else: 
                     break 
             
             accumulated_batch_loss = accumulated_batch_loss + sample_loss_this_item
-            final_predicted_cuis_global_idx_batch[i] = last_hop_selected_target_cuis_idx
+            # 將 current_sample_final_preds_dict 中的 final_target_idx 收集起來用於 acc 計算
+            batch_final_predictions_for_acc[i] = [
+                self.rev_cui_vocab_idx_to_str.get(pred_info['final_target_idx'])
+                for pred_info in current_sample_final_preds_dict.values()
+                if self.rev_cui_vocab_idx_to_str.get(pred_info['final_target_idx']) is not None
+            ]
+            # 確保 batch_hop1_predictions_for_acc[i] 也是去重的字符串列表
+            batch_hop1_predictions_for_acc[i] = list(set(batch_hop1_predictions_for_acc[i]))
 
 
         avg_batch_loss = accumulated_batch_loss / batch_size if batch_size > 0 else torch.tensor(0.0, device=self.device)
         
-        # Convert final predicted global indices back to CUI strings for measure_accuracy
-        final_predicted_cuis_str_batch = []
-        for idx_tensor in final_predicted_cuis_global_idx_batch:
-            final_predicted_cuis_str_batch.append(
-                [self.rev_cui_vocab_idx_to_str.get(idx.item()) for idx in idx_tensor 
-                 if self.rev_cui_vocab_idx_to_str.get(idx.item()) is not None]
-            )
-            
-        return avg_batch_loss, final_predicted_cuis_str_batch # Return CUI strings for accuracy
+        # final_predicted_cuis_str_batch 用於與 hop2_target_cuis 比較 (或者一個合併的GT)
+        # batch_hop1_predictions_for_acc 用於與 hop1_target_cuis 比較
+        # 這個返回值需要調整，以包含不同hop的預測
+        return avg_batch_loss, batch_final_predictions_for_acc, batch_hop1_predictions_for_acc
 
 
     def measure_accuracy(self, final_predicted_cuis_str_batch, target_cuis_str_batch, mode="Recall@N"):
-        # (measure_accuracy logic using string lists, as defined before)
-        # ...
+        # 這個函數需要被擴展或複製以處理不同 hop 的 accuracy
+        # 例如，可以有一個 measure_recall, measure_precision, measure_f1
+        # 這裡暫時保持原樣，但您可能需要為1-hop和最終結果分別調用它，或傳入mode
         batch_size = len(target_cuis_str_batch)
-        if batch_size == 0: return 0.0
-        accs = []
+        if batch_size == 0: return 0.0, 0.0, 0.0 # P, R, F1
+        
+        all_precisions, all_recalls, all_f1s = [], [], []
+
         for i in range(batch_size):
             gold_cuis = set(target_cuis_str_batch[i])
-            pred_cuis = set(final_predicted_cuis_str_batch[i]) # Already list of strings
+            # final_predicted_cuis_str_batch[i] 應該是去重後的字符串列表
+            pred_cuis = set(final_predicted_cuis_str_batch[i]) 
+            
             num_pred = len(pred_cuis)
             num_gold = len(gold_cuis)
             num_intersect = len(gold_cuis.intersection(pred_cuis))
@@ -1689,135 +1898,94 @@ class Trainer(nn.Module):
             recall = num_intersect / num_gold if num_gold > 0 else 0.0
             f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
             
-            # Defaulting to recall for this setup, adjust 'mode' as needed
-            acc = recall 
-            accs.append(acc)
-        return np.mean(accs) if accs else 0.0
-
+            all_precisions.append(precision)
+            all_recalls.append(recall)
+            all_f1s.append(f1)
+            
+        avg_precision = np.mean(all_precisions) if all_precisions else 0.0
+        avg_recall = np.mean(all_recalls) if all_recalls else 0.0
+        avg_f1 = np.mean(all_f1s) if all_f1s else 0.0
+        
+        return avg_precision, avg_recall, avg_f1
 
     def train(self, train_data_loader, dev_data_loader, lr_scheduler=None):
-        # (Training loop logic, as defined before, calling self.forward_per_batch)
-        # Ensure self.encoder and self.gmodel are set to train() mode at start of epoch
-        # and eval() mode for validation.
-        # ...
         if self.optimizer is None: self.create_optimizers()
         update_step = 4 
 
         for ep in range(self.nums_of_epochs):
             print(f"\n--- Starting Epoch {ep+1}/{self.nums_of_epochs} ---")
-            self.mode = 'train'
-            self.encoder.train()
-            self.gmodel.train()
-            epoch_loss_train_list = [] # Store individual batch losses
-            epoch_acc_train_list = []
-            
-            # For gradient accumulation
+            self.mode = 'train'; self.encoder.train(); self.gmodel.train()
+            epoch_loss_train_list = []
+            epoch_p1_train, epoch_r1_train, epoch_f1_1_train = [], [], [] # For 1-hop
+            epoch_p_final_train, epoch_r_final_train, epoch_f1_final_train = [], [], [] # For final preds
+
             accumulated_loss_for_step = torch.tensor(0.0, device=self.device)
-            
             train_pbar = tqdm(train_data_loader, desc=f"Epoch {ep+1} Training")
             batch_idx_in_epoch = 0
 
             for batch in train_pbar:
-                if batch is None: continue # From collate_fn
+                if batch is None: continue 
+                
+                batch_avg_loss, final_preds_str, hop1_preds_str = self.forward_per_batch(batch)
+                
+                # ## MODIFIED: 分別計算1-hop和最終(可能是混合了1-hop和2-hop)的準確率
+                p1, r1, f1_1 = self.measure_accuracy(hop1_preds_str, batch['hop1_target_cuis'])
+                p_final, r_final, f1_final = self.measure_accuracy(final_preds_str, batch['hop2_target_cuis']) # 假設最終預測主要對標 hop2 GT
 
-                # forward_per_batch returns average loss for that batch
-                batch_avg_loss, final_predictions_str = self.forward_per_batch(batch)
-                
-                # Debug Start
-                
-                if not batch_avg_loss.requires_grad:
-                    print(f"----------- ALERT: Epoch {ep+1}, Batch {batch_idx_in_epoch+1} -----------")
-                    print(f"batch_avg_loss: {batch_avg_loss.item()}, requires_grad: {batch_avg_loss.requires_grad}, grad_fn: {batch_avg_loss.grad_fn}")
-                    print("This batch resulted in a loss that does not require gradients.")
-                    print("This usually means no valid paths/targets led to a parameter-dependent loss calculation for ANY sample in this batch.")
-                    
-                    # 在這種情況下，調用 .backward() 會出錯。
-                    # 我們可以選擇跳過這個 micro-batch 的梯度更新。
-                    # 仍然需要處理梯度累積的計數器 batch_idx_in_epoch % update_step
-                    if (batch_idx_in_epoch + 1) % update_step == 0:
-                        # 如果剛好是更新步驟，但這個 micro-batch (或之前累積的) 沒有梯度
-                        # 我們可能仍然需要 zero_grad() 來清除任何可能的舊梯度（儘管理論上不應該有）
-                        # 並且不執行 optimizer.step() 如果沒有有效的梯度累積。
-                        # 一個簡單的處理是，如果整個 update_step 週期內的 loss 都是 non-grad，則不 step。
-                        # 但目前的梯度累積是每個 micro-batch 都 .backward()。
-                        # 所以，如果 loss_to_accumulate 不 require_grad，就不 backward。
-                        print("Skipping backward pass for this micro-batch as loss does not require grad.")
-                        # accumulated_loss_for_step 應該不會被這個 non-grad loss 影響，因為我們只加 loss.item()
-                    # else: # 不是 optimizer step 的邊界，繼續累積（雖然這個 batch 貢獻的梯度為0）
-                    #     pass
-
-                
-                
-                
-                
-                # Debug End
-                
-                # For accuracy, use hop2_target_cuis (final hop GT)
-                target_cuis_str_for_acc = batch['hop2_target_cuis']
-                batch_acc = self.measure_accuracy(final_predictions_str, target_cuis_str_for_acc)
+                # 記錄用於epoch平均的指標
+                epoch_p1_train.append(p1); epoch_r1_train.append(r1); epoch_f1_1_train.append(f1_1)
+                epoch_p_final_train.append(p_final); epoch_r_final_train.append(r_final); epoch_f1_final_train.append(f1_final)
 
                 if torch.isnan(batch_avg_loss) or torch.isinf(batch_avg_loss):
-                    print(f"Warning: NaN/Inf loss detected at Epoch {ep+1}, Batch {batch_idx_in_epoch+1}. Skipping step.")
-                    # Important: if skipping, zero out any accumulated grad for THIS batch
-                    self.optimizer.zero_grad() 
-                    accumulated_loss_for_step = torch.tensor(0.0, device=self.device) # Reset for next accumulation cycle
-                    batch_idx_in_epoch +=1
-                    continue
+                    print(f"Warning: NaN/Inf loss @ Epoch {ep+1}, Batch {batch_idx_in_epoch+1}. Skipping."); self.optimizer.zero_grad(); accumulated_loss_for_step = torch.tensor(0.0, device=self.device); batch_idx_in_epoch +=1; continue
                 
-                # Normalize loss for accumulation
+                
                 loss_to_accumulate = batch_avg_loss / update_step
+                # print(f"DEBUG: loss_to_accumulate: {loss_to_accumulate.item()}, requires_grad: {loss_to_accumulate.requires_grad}, grad_fn: {loss_to_accumulate.grad_fn}")
+                # print(f"DEBUG: batch_avg_loss: {batch_avg_loss.item()}, requires_grad: {batch_avg_loss.requires_grad}, grad_fn: {batch_avg_loss.grad_fn}")
+        
                 loss_to_accumulate.backward()
-                accumulated_loss_for_step = accumulated_loss_for_step + loss_to_accumulate.detach() # Track accumulated loss for logging
-
-                epoch_loss_train_list.append(batch_avg_loss.item()) # Log actual (non-normalized) batch average loss
-                epoch_acc_train_list.append(batch_acc)
+                accumulated_loss_for_step += loss_to_accumulate.detach()
+                epoch_loss_train_list.append(batch_avg_loss.item())
 
                 if (batch_idx_in_epoch + 1) % update_step == 0:
                     torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0)
                     torch.nn.utils.clip_grad_norm_(self.gmodel.parameters(), 1.0)
                     self.optimizer.step()
                     self.optimizer.zero_grad()
-                    
-                    # Log accumulated loss
-                    avg_loss_over_update_steps = accumulated_loss_for_step.item() # This is sum of normalized losses
-                    train_pbar.set_postfix({'Step Loss': f'{avg_loss_over_update_steps:.4f}', 'Batch Acc': f'{batch_acc:.4f}'})
-                    accumulated_loss_for_step = torch.tensor(0.0, device=self.device) # Reset for next cycle
-                
+                    train_pbar.set_postfix({'L': f'{accumulated_loss_for_step.item():.3f}', 
+                                            'F1@1': f'{f1_1:.3f}', 'F1@Final': f'{f1_final:.3f}'})
+                    accumulated_loss_for_step = torch.tensor(0.0, device=self.device)
                 batch_idx_in_epoch +=1
 
-            # Handle any remaining gradients if epoch size not multiple of update_step
-            if batch_idx_in_epoch % update_step != 0 and accumulated_loss_for_step > 0 :
-                 torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0)
-                 torch.nn.utils.clip_grad_norm_(self.gmodel.parameters(), 1.0)
-                 self.optimizer.step()
-                 self.optimizer.zero_grad()
+            if batch_idx_in_epoch % update_step != 0 and accumulated_loss_for_step.item() > 0 :
+                 torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0); torch.nn.utils.clip_grad_norm_(self.gmodel.parameters(), 1.0)
+                 self.optimizer.step(); self.optimizer.zero_grad()
 
-            avg_epoch_train_loss = np.mean(epoch_loss_train_list) if epoch_loss_train_list else float('nan')
-            avg_epoch_train_acc = np.mean(epoch_acc_train_list) if epoch_acc_train_list else float('nan')
-            print(f"\nEpoch {ep+1} Avg Training Loss: {avg_epoch_train_loss:.4f}, Avg Training Acc: {avg_epoch_train_acc:.4f}")
+            avg_ep_train_loss = np.mean(epoch_loss_train_list) if epoch_loss_train_list else float('nan')
+            avg_ep_f1_1_train = np.mean(epoch_f1_1_train) if epoch_f1_1_train else float('nan')
+            avg_ep_f1_final_train = np.mean(epoch_f1_final_train) if epoch_f1_final_train else float('nan')
+            print(f"\nEpoch {ep+1} Train Avg: Loss={avg_ep_train_loss:.4f}, F1@1={avg_ep_f1_1_train:.4f}, F1@Final={avg_ep_f1_final_train:.4f}")
 
-            # Validation, LR Scheduling, Early Stopping (as before)
-            # ...
-            avg_epoch_dev_loss, avg_epoch_dev_acc = self.validate(dev_data_loader) # Pass loader
-            print(f"Epoch {ep+1} Validation Loss: {avg_epoch_dev_loss:.4f}, Validation Acc: {avg_epoch_dev_acc:.4f}")
+            avg_ep_dev_loss, avg_ep_p1_dev, avg_ep_r1_dev, avg_ep_f1_1_dev, \
+            avg_ep_p_final_dev, avg_ep_r_final_dev, avg_ep_f1_final_dev = self.validate(dev_data_loader)
+            print(f"Epoch {ep+1} Valid Avg: Loss={avg_ep_dev_loss:.4f}, P@1={avg_ep_p1_dev:.4f}, R@1={avg_ep_r1_dev:.4f}, F1@1={avg_ep_f1_1_dev:.4f} | P@Final={avg_ep_p_final_dev:.4f}, R@Final={avg_ep_r_final_dev:.4f}, F1@Final={avg_ep_f1_final_dev:.4f}")
 
-            if lr_scheduler:
-                lr_scheduler.step() # Or lr_scheduler.step(avg_epoch_dev_loss) if ReduceLROnPlateau
+            if lr_scheduler: lr_scheduler.step()
 
-            # Early Stopping Logic (as before)
-            current_metric_val = avg_epoch_dev_loss if self.early_stopping_metric == 'val_loss' else avg_epoch_dev_acc
+            # ## MODIFIED: Early Stopping and Model Saving based on a primary metric, e.g., F1@Final
+            current_metric_val = avg_ep_f1_final_dev # 或者 val_loss: avg_ep_dev_loss
+            # ... (提前停止與模型保存邏輯，與之前類似，只是選擇比較的指標可能改變) ...
+            # ... (例如，如果 F1@Final 提升則保存模型) ...
             improved = False
             if self.early_stopping_metric == 'val_loss':
-                if current_metric_val < self.best_metric_val - self.early_stopping_delta:
-                    improved = True
-            else: # val_acc
-                if current_metric_val > self.best_metric_val + self.early_stopping_delta:
-                    improved = True
+                if current_metric_val < self.best_metric_val - self.early_stopping_delta: improved = True
+            elif self.early_stopping_metric == 'val_acc': # 這裡用 F1@Final 作為 val_acc
+                if current_metric_val > self.best_metric_val + self.early_stopping_delta: improved = True
             
             if improved:
-                print(f"Metric improved ({self.best_metric_val:.4f} --> {current_metric_val:.4f}). Saving model...")
-                self.best_metric_val = current_metric_val
-                self.epochs_no_improve = 0
+                print(f"Validation metric ({self.early_stopping_metric}) improved ({self.best_metric_val:.4f} --> {current_metric_val:.4f}). Saving model...")
+                self.best_metric_val = current_metric_val; self.epochs_no_improve = 0
                 if self.save_model_path:
                     try:
                         torch.save(self.gmodel.state_dict(), self.save_model_path)
@@ -1827,49 +1995,51 @@ class Trainer(nn.Module):
                     except Exception as e: print(f"Error saving model: {e}")
             else:
                 self.epochs_no_improve += 1
-                print(f"Metric did not improve for {self.epochs_no_improve} epoch(s). Best: {self.best_metric_val:.4f}")
+                print(f"Validation metric ({self.early_stopping_metric}) did not improve for {self.epochs_no_improve} epoch(s). Best: {self.best_metric_val:.4f}")
 
             if self.epochs_no_improve >= self.early_stopping_patience:
-                self.early_stop = True
-                print(f"\nEarly stopping triggered after {ep+1} epochs.")
-                break 
+                self.early_stop = True; print(f"\nEarly stopping triggered after {ep+1} epochs."); break 
             print("-" * 50)
         
         if not self.early_stop: print("Training finished after all epochs.")
 
 
     def validate(self, dev_data_loader):
-        # (Validation loop logic, as defined before, calling self.forward_per_batch)
-        # ...
         print("Running validation...")
-        self.mode = 'eval' # Set mode to eval
-        self.encoder.eval()
-        self.gmodel.eval()
+        self.mode = 'eval'; self.encoder.eval(); self.gmodel.eval()
         epoch_loss_dev_list = []
-        epoch_acc_dev_list = []
+        epoch_p1_dev, epoch_r1_dev, epoch_f1_1_dev = [], [], []
+        epoch_p_final_dev, epoch_r_final_dev, epoch_f1_final_dev = [], [], []
+        
         dev_pbar = tqdm(dev_data_loader, desc="Validation")
-
         with torch.no_grad():
             for batch in dev_pbar:
                 if batch is None: continue
-                batch_avg_loss, final_predictions_str = self.forward_per_batch(batch)
-                target_cuis_str_for_acc = batch['hop2_target_cuis'] # Final hop GT
-                batch_acc = self.measure_accuracy(final_predictions_str, target_cuis_str_for_acc)
+                batch_avg_loss, final_preds_str, hop1_preds_str = self.forward_per_batch(batch)
+                
+                p1, r1, f1_1 = self.measure_accuracy(hop1_preds_str, batch['hop1_target_cuis'])
+                p_final, r_final, f1_final = self.measure_accuracy(final_preds_str, batch['hop2_target_cuis']) # 假設
 
                 epoch_loss_dev_list.append(batch_avg_loss.item())
-                epoch_acc_dev_list.append(batch_acc)
-                dev_pbar.set_postfix({'Loss': f'{batch_avg_loss.item():.4f}', 'Acc': f'{batch_acc:.4f}'})
+                epoch_p1_dev.append(p1); epoch_r1_dev.append(r1); epoch_f1_1_dev.append(f1_1)
+                epoch_p_final_dev.append(p_final); epoch_r_final_dev.append(r_final); epoch_f1_final_dev.append(f1_final)
+                dev_pbar.set_postfix({'L': f'{batch_avg_loss.item():.3f}', 'F1@1': f'{f1_1:.3f}', 'F1@Final': f'{f1_final:.3f}'})
 
         avg_loss = np.mean(epoch_loss_dev_list) if epoch_loss_dev_list else float('nan')
-        avg_acc = np.mean(epoch_acc_dev_list) if epoch_acc_dev_list else float('nan')
-        return avg_loss, avg_acc
-
+        avg_p1 = np.mean(epoch_p1_dev) if epoch_p1_dev else 0.0
+        avg_r1 = np.mean(epoch_r1_dev) if epoch_r1_dev else 0.0
+        avg_f1_1 = np.mean(epoch_f1_1_dev) if epoch_f1_1_dev else 0.0
+        avg_p_final = np.mean(epoch_p_final_dev) if epoch_p_final_dev else 0.0
+        avg_r_final = np.mean(epoch_r_final_dev) if epoch_r_final_dev else 0.0
+        avg_f1_final = np.mean(epoch_f1_final_dev) if epoch_f1_final_dev else 0.0
+        
+        return avg_loss, avg_p1, avg_r1, avg_f1_1, avg_p_final, avg_r_final, avg_f1_final
 
 # ====================== Main Block ======================
 if __name__ =='__main__':
 
-   
     
+
     # --- 常規設置與資源加載 (假設這些已存在或從 args 讀取) ---
     # !!! 確保這些變量已定義並加載好 !!!
     # args = parser.parse_args() # 如果使用 argparse
@@ -1878,8 +2048,8 @@ if __name__ =='__main__':
     
     CUI_EMBEDDING_FILE = "./drknows/GraphModel_SNOMED_CUI_Embedding.pkl"
     
-    TRAIN_ANNOTATION_FILE = "./MediQ/mediq_train_annotations.json"
-    DEV_ANNOTATION_FILE = './MediQ/mediq_dev_annotations.json'
+    TRAIN_ANNOTATION_FILE = "./MediQ/mediq_train_annotations_bm25_20.json"
+    DEV_ANNOTATION_FILE = './MediQ/mediq_dev_annotations_bm25_20.json'
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -1898,7 +2068,7 @@ if __name__ =='__main__':
     try:
         # 將 device 傳遞給 CuiEmbedding 的構造函數
         cui_embedding_lookup_obj = CuiEmbedding(CUI_EMBEDDING_FILE, device=device)
-        print("真實 CuiEmbedding 實例化成功。")
+        print(" CuiEmbedding 實例化成功。")
     except Exception as e:
         print(f"實例化 CuiEmbedding 時出錯: {e}"); exit()
     
@@ -1916,17 +2086,17 @@ if __name__ =='__main__':
     hdim = base_encoder_model.config.hidden_size
     nums_of_head = 3 
     top_n = 8 
-    epochs = 300 
+    epochs = 1 
     LR = 1e-5 
     intermediate_loss_flag = True 
     contrastive_flag = True 
-    batch_size = 1 
+    batch_size = 4 
     
     gin_hidden_dim_val = hdim 
     gin_num_layers_val = 2  
 
 
-    temp_edge_enc = EdgeOneHot(graph=g_nx_loaded)
+    temp_edge_enc = EdgeOneHot(graph=g_nx_loaded, device=device)
     actual_input_edge_dim_for_gin = temp_edge_enc.onehot_mat.shape[-1]
     if actual_input_edge_dim_for_gin == 0 and g_nx_loaded.number_of_edges() > 0:
         print("警告: 為 GIN 確定的 input_edge_dim 是 0。GIN 可能無法按預期工作，如果它需要邊緣特徵。")
@@ -1940,7 +2110,7 @@ if __name__ =='__main__':
         tokenizer=tokenizer,
         encoder=base_encoder_model,
         g_nx=g_nx_loaded,
-        cui_embedding_lookup=cui_embedding_lookup_obj, # *** 使用真實的嵌入對象 ***
+        cui_embedding_lookup=cui_embedding_lookup_obj, 
         hdim=hdim,
         nums_of_head=nums_of_head,
         cui_vocab_str_to_idx=cui_vocab_for_trainer,
@@ -1953,12 +2123,12 @@ if __name__ =='__main__':
         intermediate=intermediate_loss_flag,
         save_model_path=model_save_path,
         gnn_update=True, 
-        path_encoder_type="MLP",
+        path_encoder_type="Transformer",
         path_ranker_type="Flat",
         gnn_type="Stack", 
         gin_hidden_dim=gin_hidden_dim_val,
         gin_num_layers=gin_num_layers_val,
-        input_edge_dim_for_gin=actual_input_edge_dim_for_gin,
+        #input_edge_dim_for_gin=actual_input_edge_dim_for_gin,
         early_stopping_patience=3,
         early_stopping_metric='val_loss'
     )
@@ -1978,19 +2148,19 @@ if __name__ =='__main__':
     if len(train_dataset_obj) == 0 or len(dev_dataset_obj) == 0:
         print("Error: A dataset is empty after loading!"); exit()
 
-    train_loader_instance = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_mediq_paths)
-    dev_loader_instance = DataLoader(dev_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths)
+    train_loader_instance = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_mediq_paths, num_workers=6, pin_memory=True)
+    dev_loader_instance = DataLoader(dev_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths, num_workers=6, pin_memory=True)
     print("Dataloaders created.")
 
-    print("\n" + "="*30 + "\n STARTING Tensorized Trainer RUN (REAL EMBEDDINGS) \n" + "="*30 + "\n")
+    print("\n" + "="*30 + "\n STARTING Tensorized Trainer RUN  \n" + "="*30 + "\n")
     try: 
         trainer_instance.train(train_loader_instance, dev_loader_instance, lr_scheduler_instance)
     except Exception as e:
         print(f"ERROR DURING TRAINING RUN: {e}")
         import traceback
         traceback.print_exc()
-    print("\n" + "="*30 + "\n TENSORIZED TRAINER RUN (REAL EMBEDDINGS) FINISHED \n" + "="*30 + "\n")
+    print("\n" + "="*30 + "\n TENSORIZED TRAINER RUN FINISHED \n" + "="*30 + "\n")
 
-
+    
     
 

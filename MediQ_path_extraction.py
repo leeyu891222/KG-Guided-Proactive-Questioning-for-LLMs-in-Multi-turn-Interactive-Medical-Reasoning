@@ -12,10 +12,10 @@ print("載入資源中...")
 
 # --- 配置 ---
 # !!! 請確保這些路徑是正確的 !!!
-MEDIQA_FILE = './MediQ/all_dev_convo.jsonl'
+MEDIQA_FILE = './MediQ/all_test_convo.jsonl'
 GRAPH_FILE = './drknows/SNOMED_CUI_MAJID_Graph_wSelf.pkl'
 # CUI_DICT_FILE = './drknows/sm_t047_cui_aui_eng.pkl' # 暫不直接用於過濾，主要用圖譜節點
-OUTPUT_ANNOTATION_FILE = './MediQ/mediq_dev_annotations.json' # 輸出的標註文件
+OUTPUT_ANNOTATION_FILE = './MediQ/mediq_test_annotations.json' # 輸出的標註文件
 
 # SciSpaCy 模型 - 你可能需要根據安裝情況調整模型名稱
 # 例如：en_core_sci_sm, en_core_sci_md, en_core_sci_lg, en_ner_bc5cdr_md 等
