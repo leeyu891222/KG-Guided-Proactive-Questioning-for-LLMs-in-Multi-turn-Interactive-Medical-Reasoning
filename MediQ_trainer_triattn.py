@@ -30,7 +30,7 @@ from collections import OrderedDict, defaultdict
 # tokenizer = AutoTokenizer.from_pretrained("cambridgeltl/SapBERT-from-PubMedBERT-fulltext") # Or your model path
 # Try to import torch_scatter, if not available, print a warning
 try:
-    from torch_scatter import scatter_add, scatter_mean
+    from torch_scatter import scatter_add, scatter_max
     TORCH_SCATTER_AVAILABLE = True
     print("torch_scatter is available.")
 except ImportError:
@@ -779,27 +779,18 @@ class EdgeOneHot(object): # Using the dynamic one from user's code
             self.onehot_mat = torch.empty(0,0, device=self.device).float() # Or torch.zeros(1,1).float() if a min dim is needed
         else:
             self.onehot_mat = F.one_hot(torch.arange(0, self.num_edge_types, device=self.device), num_classes=self.num_edge_types).float()
-    def Lookup(self, edge_labels: list):
-        if self.num_edge_types == 0: # No edge types defined
-            # Return a zero tensor of expected dimensionality if possible, or empty.
-            # This depends on what PathEncoder expects as edge_feature_dim_for_path_encoder.
-            # If EdgeOneHot created a (0,0) mat, this will error.
-            # Let's assume if num_edge_types is 0, edge_dim is 0.
-            # PathEncoder should handle edge_dim=0 (e.g., not concat edge embs).
-            if hasattr(self, '_expected_edge_dim_downstream') and self._expected_edge_dim_downstream > 0:
-                 return torch.zeros(len(edge_labels), self._expected_edge_dim_downstream) # Fallback
-            return torch.empty(len(edge_labels), 0) # Correct if edge_dim is 0
+    def Lookup(self, edge_indices_tensor: torch.Tensor):
+        # device = self.onehot_mat.device # 確保返回張量在正確設備
+        if self.num_edge_types == 0: # 處理沒有邊類型的情況
+            # 如果下游期望一個特定的維度（例如 actual_edge_dim），即使是0，也要匹配
+            # 假設若 num_edge_types 為0，則 actual_edge_dim 也應為0
+            # （或者在 __init__ 中將 num_edge_types 設為至少1，並有一個 UNKNOWN 類型）
+            return torch.empty(edge_indices_tensor.size(0), 0, device=self.device) 
 
-        indices = []
-        for e in edge_labels:
-            if e in self.edge_mappings: indices.append(self.edge_mappings[e])
-            elif self.unknown_rel_index is not None: indices.append(self.unknown_rel_index)
-            else: indices.append(0) # Fallback
-        indices_tensor = torch.tensor(indices, dtype=torch.long, device=self.device)
-        indices_tensor = torch.clamp(indices_tensor, 0, self.num_edge_types - 1 if self.num_edge_types > 0 else 0)
-        if self.num_edge_types == 0 : # Should not happen if clamp works correctly
-            return torch.empty(len(edge_labels), 0)
-        return self.onehot_mat[indices_tensor]
+        # 確保索引在有效範圍內，防止 OOB 錯誤
+        clamped_indices = torch.clamp(edge_indices_tensor, 0, self.num_edge_types - 1)
+        
+        return self.onehot_mat[clamped_indices]
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -1123,6 +1114,57 @@ class GraphModel(nn.Module):
         self.g_tensorized = preprocess_graph_to_tensors(g_nx) # Preprocess NX graph
         self.n_encoder_lookup = cui_embedding_lookup # For string CUI to embedding
         self.device = device
+        
+        
+        num_graph_nodes = self.g_tensorized['num_nodes']
+        idx_to_cui_map_for_init = self.g_tensorized['idx_to_cui']
+
+        all_embeddings_list = []
+        found_count = 0
+        if self.n_encoder_lookup.embedding_dim is None and num_graph_nodes > 0:
+            # 嘗試從第一個有效CUI推斷維度，如果CuiEmbedding的dim未設置
+            # 這是一個回退，理想情況下CuiEmbedding.__init__應能確定dim
+            first_valid_cui_for_dim_check = idx_to_cui_map_for_init.get(0)
+            if first_valid_cui_for_dim_check:
+                temp_emb_for_dim_check = self.n_encoder_lookup.encode([first_valid_cui_for_dim_check])
+                if temp_emb_for_dim_check.numel() > 0:
+                    self.hdim = temp_emb_for_dim_check.shape[-1] # 更新hdim以匹配實際嵌入維度
+                    print(f"GraphModel: hdim 已根據實際嵌入更新為 {self.hdim}")
+
+
+        print(f"GraphModel: 正在為 {num_graph_nodes} 個節點創建全局嵌入矩陣...")
+        for i in range(num_graph_nodes):
+            cui_str = idx_to_cui_map_for_init.get(i)
+            if cui_str is not None:
+                # CuiEmbedding.encode 返回 [1, hdim] (如果輸入是列表) 或 [hdim]
+                # 我們需要確保是一致的 [hdim]
+                emb_tensor = self.n_encoder_lookup.encode([cui_str]) # 輸入列表以獲得批次輸出
+                if emb_tensor.numel() > 0:
+                    all_embeddings_list.append(emb_tensor.squeeze(0)) # 移除批次維度
+                    found_count += 1
+                else: # CUI存在於圖中但不在嵌入字典中
+                    print(f"警告: CUI '{cui_str}' (索引 {i}) 在圖中但未找到其嵌入，將使用零向量。")
+                    all_embeddings_list.append(torch.zeros(self.hdim, device=self.device))
+            else: # 理論上不應發生，因為 idx_to_cui_map 應包含所有 0 到 num_nodes-1 的索引
+                print(f"警告: 全局CUI索引 {i} 未在 idx_to_cui_map 中找到，將使用零向量。")
+                all_embeddings_list.append(torch.zeros(self.hdim, device=self.device))
+
+        if all_embeddings_list:
+            self.global_cui_embedding_matrix = torch.stack(all_embeddings_list).to(self.device)
+            print(f"GraphModel: 全局嵌入矩陣創建完畢，形狀: {self.global_cui_embedding_matrix.shape}，找到 {found_count}/{num_graph_nodes} 個嵌入。")
+        else: # 如果圖中沒有節點，或者所有節點都沒有嵌入
+            print(f"GraphModel: 未能創建全局嵌入矩陣 (可能是圖中無節點或無嵌入)。")
+            self.global_cui_embedding_matrix = torch.empty(0, self.hdim, device=self.device)
+
+        # 將 global_cui_embedding_matrix 註冊為緩衝區，使其隨模型移動到不同設備，且不被視為可訓練參數
+        self.register_buffer('global_cui_embedding_matrix_buffer', self.global_cui_embedding_matrix)
+        # 在使用時，可以用 self.global_cui_embedding_matrix_buffer 替代 self.global_cui_embedding_matrix
+        # 或者在 __init__ 結束時 self.global_cui_embedding_matrix = self.global_cui_embedding_matrix_buffer
+                
+        
+        
+        
+        
         # Edge encoder needs the tensorized graph's edge_to_idx for dynamic mapping
         # Or, if EdgeOneHot is modified to take graph_nx and build its own mapping:
         self.e_encoder = EdgeOneHot(graph=g_nx, device=self.device) # Assumes EdgeOneHot can handle NX graph
@@ -1183,39 +1225,22 @@ class GraphModel(nn.Module):
         
 
     def _get_embeddings_by_indices(self, cui_indices_tensor):
-        """Helper to get embeddings for a tensor of CUI indices."""
+        """
+        直接從預存的全局嵌入矩陣中通過索引獲取嵌入。
+        Args:
+            cui_indices_tensor (torch.Tensor): 包含全局CUI索引的1D Tensor。
+        Returns:
+            torch.Tensor: 形狀為 [len(cui_indices_tensor), hdim] 的嵌入張量。
+        """
         if cui_indices_tensor is None or cui_indices_tensor.numel() == 0:
-            return torch.tensor([], device=self.device) # Return empty tensor on device
-        
-        # Convert indices back to CUI strings for lookup (inefficient, but uses existing n_encoder_lookup)
-        # Ideal: n_encoder_lookup.encode_by_idx(cui_indices_tensor)
-        idx_to_cui_map = self.g_tensorized['idx_to_cui']
-        cui_strings = [idx_to_cui_map.get(idx.item()) for idx in cui_indices_tensor]
-        
-        # Filter out None if any index was not in map (should not happen if indices are from graph)
-        valid_cui_strings = [s for s in cui_strings if s is not None]
-        if not valid_cui_strings:
-            return torch.tensor([], device=self.device)
-            
-        # This will return a tensor of shape [num_valid_cuis, 1, hdim] if encode expects list
-        # or [num_valid_cuis, hdim] if it handles batching.
-        # CuiEmbedding.encode returns [N, 1, D], so squeeze later.
-        try:
-            embeddings = self.n_encoder_lookup.encode(valid_cui_strings).to(self.device) # Ensure on device
-            # We need to map these back to the original order of cui_indices_tensor if some were invalid
-            # For now, assume all indices map to valid CUIs and are found by encode
-            if len(valid_cui_strings) != cui_indices_tensor.numel():
-                 print(f"Warning: Some CUI indices could not be mapped or embedded. Original: {cui_indices_tensor.numel()}, Valid: {len(valid_cui_strings)}")
-                 # This part is tricky: how to create a tensor of correct size with zeros for missing?
-                 # For simplicity, we proceed with only valid embeddings. This might break downstream if sizes don't match.
-                 # A robust solution would involve creating a zero tensor and filling it.
-            return embeddings.squeeze(1) # Shape [N, D]
-        except KeyError as e:
-            print(f"KeyError during embedding lookup in _get_embeddings_by_indices: {e}")
-            return torch.tensor([], device=self.device)
-        except Exception as e:
-            print(f"Unexpected error in _get_embeddings_by_indices: {e}")
-            return torch.tensor([], device=self.device)
+            return torch.empty(0, self.hdim, device=self.device) # 返回正確形狀的空張量
+
+        # 確保索引在有效範圍內 (可選，但推薦)
+        # clamped_indices = torch.clamp(cui_indices_tensor, 0, self.global_cui_embedding_matrix.size(0) - 1)
+        # return self.global_cui_embedding_matrix[clamped_indices]
+
+        # 或者，假設傳入的 cui_indices_tensor 總是有效的
+        return self.global_cui_embedding_matrix[cui_indices_tensor]
 
 
     def one_iteration(self,
@@ -1257,21 +1282,46 @@ class GraphModel(nn.Module):
         if unique_src_embs_base.numel() == 0 or unique_tgt_embs.numel() == 0:
             # print(f"Debug: Failed to get base embeddings for src or tgt at hop {running_k_hop}")
             return None, {}, None, True
+        
+        # 獲取圖譜中最大的CUI索引值，以確定映射張量的大小
+        # 假設 self.g_tensorized['num_nodes'] 是節點總數，索引從 0 到 num_nodes-1
+        max_cui_idx_in_graph = self.g_tensorized['num_nodes'] - 1 
+
+        # --- 針對 unique_hop_src_indices 的映射 ---
+        # 初始化映射張量，填充-1（表示該全局索引不在當前的unique集合中）
+        map_global_src_to_local_tensor = torch.full((max_cui_idx_in_graph + 1,), -1, dtype=torch.long, device=self.device)
+        if unique_hop_src_indices.numel() > 0: # 僅當 unique_hop_src_indices 非空時操作
+            local_indices_for_src = torch.arange(unique_hop_src_indices.numel(), device=self.device)
+            map_global_src_to_local_tensor[unique_hop_src_indices] = local_indices_for_src
+
+        # --- 針對 unique_hop_tgt_indices 的映射 ---
+        map_global_tgt_to_local_tensor = torch.full((max_cui_idx_in_graph + 1,), -1, dtype=torch.long, device=self.device)
+        if unique_hop_tgt_indices.numel() > 0: # 僅當 unique_hop_tgt_indices 非空時操作
+            local_indices_for_tgt = torch.arange(unique_hop_tgt_indices.numel(), device=self.device)
+            map_global_tgt_to_local_tensor[unique_hop_tgt_indices] = local_indices_for_tgt
+
+        # --- 針對 unique_mem_orig_src_indices 的映射 (如果 Transformer 會用到) ---
+        map_global_mem_orig_src_to_local_tensor = torch.full((max_cui_idx_in_graph + 1,), -1, dtype=torch.long, device=self.device)
+        if unique_mem_orig_src_indices is not None and unique_mem_orig_src_indices.numel() > 0:
+            local_indices_for_mem_orig_src = torch.arange(unique_mem_orig_src_indices.numel(), device=self.device)
+            map_global_mem_orig_src_to_local_tensor[unique_mem_orig_src_indices] = local_indices_for_mem_orig_src
             
-        map_global_src_idx_to_local_in_unique = {
-            glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_src_indices)
-        }
+        # map_global_src_idx_to_local_in_unique = {glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_src_indices)}
         # This scatter_index maps each path's global source CUI to its 0..N-1 index within unique_hop_src_indices
-        scatter_src_index_for_gin_agg = torch.tensor(
-            [map_global_src_idx_to_local_in_unique[glob_idx.item()] for glob_idx in cand_src_idx_hop],
-            dtype=torch.long, device=self.device
-        )
+        scatter_src_index_for_gin_agg = map_global_src_to_local_tensor[cand_src_idx_hop]
 
         # Get edge embeddings for all paths
         # EdgeOneHot.Lookup expects list of labels, convert cand_edge_idx_hop back to labels
-        idx_to_edge_map = self.g_tensorized['idx_to_edge']
-        edge_labels_for_paths = [idx_to_edge_map.get(idx.item(), "UNKNOWN_REL_LOOKUP") for idx in cand_edge_idx_hop]
-        path_edge_embs_for_gin_and_path_enc = self.e_encoder.Lookup(edge_labels_for_paths).to(self.device)
+        # --- 在 cand_edge_idx_hop 被定義之後 ---
+        # 現在 EdgeOneHot.Lookup 直接接收索引張量
+        # cand_edge_idx_hop 本身就是邊類型的索引 (0 到 num_edge_types-1)
+        if cand_edge_idx_hop.numel() > 0: # 僅當有邊時才查找
+            path_edge_embs_for_gin_and_path_enc = self.e_encoder.Lookup(cand_edge_idx_hop)
+            # .to(self.device) 通常由 self.e_encoder.onehot_mat 初始化時或 Lookup 內部保證
+        else: # 如果沒有邊索引 (例如，沒有路徑被找到)
+            # actual_edge_dim 應在 __init__ 中從 self.e_encoder.num_edge_types 獲取
+            actual_edge_dim = self.e_encoder.num_edge_types if self.e_encoder.num_edge_types > 0 else 0
+            path_edge_embs_for_gin_and_path_enc = torch.empty(0, actual_edge_dim, device=self.device)
 
 
         current_path_src_embs_for_encoding = unique_src_embs_base.clone()
@@ -1288,13 +1338,32 @@ class GraphModel(nn.Module):
         # We need to aggregate target+edge features for each source in unique_hop_src_indices.
         if self.gnn_update and self.gnn:
 
-            map_global_tgt_idx_to_local_in_unique = {
-                 glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices)
-            }
-            gin_path_tgt_node_features = unique_tgt_embs[
-                torch.tensor([map_global_tgt_idx_to_local_in_unique[glob_idx.item()] for glob_idx in cand_tgt_idx_hop],
-                             dtype=torch.long, device=self.device)
-            ]
+            # map_global_tgt_to_local_tensor 應該已經在前面根據 unique_hop_tgt_indices 創建好了
+            # unique_tgt_embs 也已經準備好
+
+            local_indices_for_gin_targets = map_global_tgt_to_local_tensor[cand_tgt_idx_hop]
+            
+            # 錯誤處理：檢查是否有 -1 索引
+            if torch.any(local_indices_for_gin_targets == -1):
+                print(f"警告 (gin_path_tgt_node_features): cand_tgt_idx_hop 中存在未映射到 unique_hop_tgt_indices 的索引。")
+                # 根據您的策略處理錯誤，例如，如果決定過濾：
+                # valid_mask = (local_indices_for_gin_targets != -1)
+                # local_indices_for_gin_targets = local_indices_for_gin_targets[valid_mask]
+                # # 其他與路徑對應的張量 (如 scatter_src_index_for_gin_agg, path_edge_embs_for_gin_and_path_enc)
+                # # 也需要用這個 valid_mask 或等效方式進行篩選，以保持一致性。
+                # # 這會使邏輯複雜化，所以更好的方式是確保 cand_tgt_idx_hop 中的所有索引都是有效的。
+                # 暫時假設所有索引都有效，或者在發現-1時拋出錯誤以便調試：
+                if torch.any(local_indices_for_gin_targets == -1):
+                     raise ValueError("gin_path_tgt_node_features: 發現無效的-1索引，這表示 cand_tgt_idx_hop 與 unique_hop_tgt_indices 不一致。")
+
+            # 確保 unique_tgt_embs 非空且索引有效
+            if unique_tgt_embs.numel() > 0:
+                gin_path_tgt_node_features = unique_tgt_embs[local_indices_for_gin_targets]
+            elif cand_tgt_idx_hop.numel() > 0: # 有目標索引，但 unique_tgt_embs 為空 (不應發生)
+                print(f"警告: unique_tgt_embs 為空，但 cand_tgt_idx_hop 並非如此。無法為 GNN 獲取有效的 gin_path_tgt_node_features。")
+                gin_path_tgt_node_features = torch.empty(0, self.hdim, device=self.device)
+            else: # cand_tgt_idx_hop 也為空
+                gin_path_tgt_node_features = torch.empty(0, self.hdim, device=self.device)
 
             updated_src_embs_from_gin, _ = self.gnn(
                 current_path_src_embs_for_encoding, # x_src_unique
@@ -1312,17 +1381,24 @@ class GraphModel(nn.Module):
         if num_paths_this_hop > pruning_threshold_count: # Check against initial num_paths_this_hop
             # print(f"  Hop {running_k_hop}: Path count {num_paths_this_hop} exceeds threshold {pruning_threshold_count}. Applying pruning.")
 
-            map_global_tgt_idx_to_local_in_unique = { # Ensure this map is created using pre-pruning unique_hop_tgt_indices
-                glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices)
-            }
-            # Ensure path_specific_tgt_local_indices can be created even if unique_tgt_embs was empty
-            if unique_tgt_embs.numel() > 0 :
-                path_specific_tgt_local_indices = torch.tensor(
-                    [map_global_tgt_idx_to_local_in_unique[glob_idx.item()] for glob_idx in cand_tgt_idx_hop],
-                    dtype=torch.long, device=self.device
-                )
-                path_specific_tgt_embs_for_pruning = unique_tgt_embs[path_specific_tgt_local_indices]
+            if unique_tgt_embs.numel() > 0 : # 確保 unique_tgt_embs 不是空的
+                local_indices_for_pruning_targets = map_global_tgt_to_local_tensor[cand_tgt_idx_hop] # 直接用映射張量
 
+                # 處理可能的 -1 索引 (如果 cand_tgt_idx_hop 中有不在 unique_hop_tgt_indices 的索引)
+                valid_mask_for_pruning_targets = (local_indices_for_pruning_targets != -1)
+                if not torch.all(valid_mask_for_pruning_targets):
+                    print(f"警告 (Pruning Input): cand_tgt_idx_hop 中存在無效索引，將被過濾或導致錯誤。")
+                    # 應對策略：只對有效索引的路徑進行後續操作，或者如果這是嚴重錯誤則拋出異常
+                    # 這裡假設如果出現-1，對應的相似度會很低或被忽略，或者 topk 會處理
+                    # 為了安全，最好確保所有索引都有效，或者過濾掉帶-1索引的路徑
+                    # local_indices_for_pruning_targets = local_indices_for_pruning_targets[valid_mask_for_pruning_targets]
+                    # expanded_task_emb 和 path_specific_tgt_embs_for_pruning 也需要對應篩選
+                    # 這會使邏輯複雜。更簡單的是假設 cand_tgt_idx_hop 中的索引總能在 map_global_tgt_to_local_tensor 中找到有效映射。
+                    if torch.any(local_indices_for_pruning_targets == -1):
+                        raise ValueError("Pruning Input: 發現無效的-1索引，cand_tgt_idx_hop 與 unique_hop_tgt_indices 不一致。")
+
+                path_specific_tgt_embs_for_pruning = unique_tgt_embs[local_indices_for_pruning_targets]
+            
                 expanded_task_emb_for_pruning = task_emb_batch.expand(path_specific_tgt_embs_for_pruning.size(0), -1)
                 target_similarity_scores = F.cosine_similarity(path_specific_tgt_embs_for_pruning, expanded_task_emb_for_pruning, dim=1)
                 
@@ -1361,35 +1437,69 @@ class GraphModel(nn.Module):
         # 準備 PathEncoder 的輸入 (src_b, combined_tgt_edge_b)
         # 這些應基於剪枝後的 cand_src_idx_hop, cand_tgt_idx_hop, path_edge_embs_for_gin_and_path_enc
         
-        # 從 current_path_src_embs_for_encoding (unique src embs 更新/未更新版) 中獲取每條剪枝後路徑的源嵌入
-        path_specific_src_embs = current_path_src_embs_for_encoding[
-            torch.tensor([map_global_src_idx_to_local_in_unique[idx.item()] for idx in cand_src_idx_hop],
-                         dtype=torch.long, device=self.device)
-        ]
+        # --- 在剪枝邏輯之後，mini-batch 迴圈之前 ---
+        # map_global_src_to_local_tensor 是基於剪枝前的 unique_hop_src_indices 創建的
+        # current_path_src_embs_for_encoding 的行序與剪枝前的 unique_hop_src_indices 對應
+        # cand_src_idx_hop 此時是剪枝後的路徑的源節點全局索引
+
+        local_indices_for_path_src = map_global_src_to_local_tensor[cand_src_idx_hop] # cand_src_idx_hop 是剪枝後的
+
+        if torch.any(local_indices_for_path_src == -1):
+            print(f"警告 (PathEncoder Src Input): 剪枝後的 cand_src_idx_hop 中存在未映射到 unique_hop_src_indices 的索引。")
+            # 應對策略：
+            if torch.all(local_indices_for_path_src == -1): # 如果所有都無效
+                 path_specific_src_embs = torch.empty(0, self.hdim, device=self.device) # 產生空張量
+            else: # 過濾掉無效的，只保留有效的
+                valid_mask = (local_indices_for_path_src != -1)
+                # 如果過濾，則所有與路徑對應的張量（cand_tgt_idx_hop, cand_edge_idx_hop 等）都需要同步篩選
+                # 這會使剪枝後的第二次篩選邏輯複雜化。
+                # 更簡單的處理（但可能引入錯誤數據）：將-1映射到一個有效索引（如0）或用0向量填充
+                # 假設：剪枝後的 cand_src_idx_hop 中的所有索引都應該能在 map_global_src_to_local_tensor 中找到有效映射
+                raise ValueError("PathEncoder Src Input: 發現無效的-1索引，這在剪枝後不應發生。")
         
-        # 從 unique_tgt_embs 中獲取每條剪枝後路徑的目標嵌入
-        # (map_global_tgt_idx_to_local_in_unique 需要在剪枝前就根據 unique_hop_tgt_indices 創建好)
-        # 這裡的 unique_hop_tgt_indices 是剪枝前的，所以 map 也應該是剪枝前的
-        # 如果剪枝了，cand_tgt_idx_hop 變短了，map_global_tgt_idx_to_local_in_unique 仍然是舊的
-        # 我們需要的是剪枝後的 unique_hop_tgt_indices 對應的 map
+        path_specific_src_embs = current_path_src_embs_for_encoding[local_indices_for_path_src]
         
-        # 重新構建 path_specific_tgt_embs 和 combined_tgt_edge_embs_for_path_enc
-        # 基於剪枝後的 cand_tgt_idx_hop 和 path_edge_embs_for_gin_and_path_enc
-        
-        # 獲取剪枝後路徑的目標節點的局部索引 (相對於 unique_tgt_embs)
-        # unique_tgt_embs 是在剪枝前計算的，所以 map_global_tgt_idx_to_local_in_unique 仍然有效
-        _map_global_tgt_idx_to_local_in_unique_for_encoding = {
-            glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices) # 使用剪枝前的 unique_hop_tgt_indices
-        }
-        path_specific_tgt_embs_for_encoding = unique_tgt_embs[
-            torch.tensor([_map_global_tgt_idx_to_local_in_unique_for_encoding[idx.item()] for idx in cand_tgt_idx_hop], # 使用剪枝後的 cand_tgt_idx_hop
-                         dtype=torch.long, device=self.device)
-        ]
-        
-        # path_edge_embs_for_gin_and_path_enc 已經在步驟 4d 被剪枝了
-        combined_tgt_edge_embs_for_path_enc = torch.cat(
-            (path_specific_tgt_embs_for_encoding, path_edge_embs_for_gin_and_path_enc), dim=-1
-        )
+        # --- 在 path_specific_src_embs 準備之後 ---
+        # map_global_tgt_to_local_tensor 是基於剪枝前的 unique_hop_tgt_indices 創建的
+        # unique_tgt_embs 的行序與剪枝前的 unique_hop_tgt_indices 對應
+        # cand_tgt_idx_hop 此時是剪枝後的路徑的目標節點全局索引
+
+        local_indices_for_path_tgt_encoding = map_global_tgt_to_local_tensor[cand_tgt_idx_hop] # cand_tgt_idx_hop 是剪枝後的
+
+        if torch.any(local_indices_for_path_tgt_encoding == -1):
+            print(f"警告 (PathEncoder Tgt Input): 剪枝後的 cand_tgt_idx_hop 中存在未映射到 unique_hop_tgt_indices 的索引。")
+            # 類似地，需要錯誤處理策略
+            raise ValueError("PathEncoder Tgt Input: 發現無效的-1索引，這在剪枝後不應發生。")
+
+        # 確保 unique_tgt_embs 非空，並且索引有效
+        if unique_tgt_embs.numel() > 0 :
+            path_specific_tgt_embs_for_encoding = unique_tgt_embs[local_indices_for_path_tgt_encoding]
+        elif cand_tgt_idx_hop.numel() > 0 : # 有剪枝後的目標索引，但 unique_tgt_embs 最初就為空
+             print(f"警告: unique_tgt_embs 為空，無法為PathEncoder獲取有效的 path_specific_tgt_embs_for_encoding。")
+             path_specific_tgt_embs_for_encoding = torch.empty(0, self.hdim, device=self.device)
+        else: # 剪枝後 cand_tgt_idx_hop 也為空
+            path_specific_tgt_embs_for_encoding = torch.empty(0, self.hdim, device=self.device)
+
+
+        # path_edge_embs_for_gin_and_path_enc 應該已經在剪枝步驟 4d 中被同步篩選過了
+        # 確保它的行數與 path_specific_tgt_embs_for_encoding 一致
+        if path_specific_tgt_embs_for_encoding.size(0) == path_edge_embs_for_gin_and_path_enc.size(0) and \
+           path_specific_tgt_embs_for_encoding.numel() > 0 : # 確保不對空張量進行cat
+            combined_tgt_edge_embs_for_path_enc = torch.cat(
+                (path_specific_tgt_embs_for_encoding, path_edge_embs_for_gin_and_path_enc), dim=-1
+            )
+        elif cand_tgt_idx_hop.numel() > 0 : # 如果剪枝後仍有路徑，但嵌入準備有問題
+            print(f"警告: PathEncoder 的目標嵌入或邊嵌入準備不一致或為空。 Tgt shape: {path_specific_tgt_embs_for_encoding.shape}, Edge shape: {path_edge_em_bs_for_gin_and_path_enc.shape}")
+            # 創建一個正確形狀的空張量或零張量，以避免後續 mini-batch 迴圈出錯
+            # actual_edge_dim 需要從 self.e_encoder.num_edge_types 獲取
+            _actual_edge_dim = self.e_encoder.num_edge_types if self.e_encoder.num_edge_types > 0 else 0
+            combined_tgt_edge_embs_for_path_enc = torch.empty(0, self.hdim + _actual_edge_dim, device=self.device)
+            if path_specific_tgt_embs_for_encoding.size(0) != path_edge_embs_for_gin_and_path_enc.size(0) and path_specific_tgt_embs_for_encoding.numel() > 0 and path_edge_embs_for_gin_and_path_enc.numel() > 0:
+                 raise ValueError("PathEncoder Tgt/Edge Input: 維度不匹配，即使在嘗試處理後。")
+
+        else: # 剪枝後沒有路徑了
+            _actual_edge_dim = self.e_encoder.num_edge_types if self.e_encoder.num_edge_types > 0 else 0
+            combined_tgt_edge_embs_for_path_enc = torch.empty(0, self.hdim + _actual_edge_dim, device=self.device)
 
         # mini-batch 迴圈現在處理的是剪枝後的路徑
         all_path_scores_hop, all_encoded_paths_hop = [], [] # 重置
@@ -1403,51 +1513,98 @@ class GraphModel(nn.Module):
             # 所以在構建序列時，需要小心地使用這些映射
             
             if self.p_encoder_type == "Transformer":
-                src_sequences_for_transformer = []
-                # 映射：全局索引 -> 在 unique 張量中的局部索引 (這些 map 基於剪枝前的 unique 索引)
-                _map_mem_orig_to_local = {glob_idx.item(): local_idx for local_idx, glob_idx in enumerate(unique_mem_orig_src_indices)} if unique_mem_orig_src_indices is not None else {}
-                _map_curr_src_to_local_for_transformer = map_global_src_idx_to_local_in_unique # 基於剪枝前的 unique_hop_src_indices
+                # --- 1. 為當前 mini-batch 批量準備所有需要的嵌入 ---
+                # 這些 cand_* 和 mem_* 張量都已經是剪枝後的了，s_ 是對它們的切片
 
-                for j_path_idx_in_batch in range(s_.start, s_.stop): # j_path_idx_in_batch 是剪枝後路徑列表的索引
+                # a. 最初始源節點的全局索引 (對於當前 mini-batch)
+                batch_mem_orig_src_idx = mem_orig_src_idx_hop[s_] if mem_orig_src_idx_hop is not None else None
+                
+                # b. 中間節點 (即當前跳的源節點) 的全局索引 (對於當前 mini-batch)
+                batch_curr_src_idx = cand_src_idx_hop[s_] 
+                
+                # c. 第ㄧ跳邊的全局類型索引 (對於當前 mini-batch)
+                batch_mem_first_edge_idx = mem_first_edge_idx_hop[s_] if mem_first_edge_idx_hop is not None else None
+
+                # 獲取這些索引對應的嵌入
+                # unique_mem_orig_src_embs 是基於剪枝前的 unique_mem_orig_src_indices
+                # map_global_mem_orig_src_to_local_tensor 也是基於剪枝前的
+                batch_orig_src_embs = None
+                if batch_mem_orig_src_idx is not None and unique_mem_orig_src_embs is not None and unique_mem_orig_src_embs.numel() > 0:
+                    local_indices = map_global_mem_orig_src_to_local_tensor[batch_mem_orig_src_idx]
+                    valid_mask = (local_indices != -1)
+                    if torch.any(valid_mask):
+                        batch_orig_src_embs = torch.zeros(batch_mem_orig_src_idx.size(0), self.hdim, device=self.device)
+                        batch_orig_src_embs[valid_mask] = unique_mem_orig_src_embs[local_indices[valid_mask]]
+                
+                # current_path_src_embs_for_encoding 是基於剪枝前的 unique_hop_src_indices (GNN可能更新過)
+                # map_global_src_to_local_tensor 也是基於剪枝前的
+                local_indices_curr = map_global_src_to_local_tensor[batch_curr_src_idx]
+                if torch.any(local_indices_curr == -1): raise ValueError("Transformer Input: 無效的batch_curr_src_idx映射")
+                batch_curr_src_embs = current_path_src_embs_for_encoding[local_indices_curr]
+
+                batch_projected_first_rel_embs = None
+                if running_k_hop == 1 and batch_mem_first_edge_idx is not None and self.edge_to_node_projection_for_transformer is not None:
+                    valid_first_edge_mask = (batch_mem_first_edge_idx != -1) & (batch_mem_first_edge_idx < self.e_encoder.onehot_mat.shape[0])
+                    if torch.any(valid_first_edge_mask):
+                        batch_projected_first_rel_embs = torch.zeros(batch_mem_first_edge_idx.size(0), self.hdim, device=self.device)
+                        
+                        first_rel_indices_to_lookup = batch_mem_first_edge_idx[valid_first_edge_mask]
+                        if first_rel_indices_to_lookup.numel() > 0 and self.e_encoder.onehot_mat.numel() > 0 : # 確保 onehot_mat 非空
+                            first_rel_one_hots = self.e_encoder.onehot_mat[first_rel_indices_to_lookup] # .to(self.device) 已在 onehot_mat 初始化時處理
+                            batch_projected_first_rel_embs[valid_first_edge_mask] = self.edge_to_node_projection_for_transformer(first_rel_one_hots)
+                
+                # --- 2. Python 迴圈逐條構建序列 (內部操作現在是從預提取的批次嵌入中索引) ---
+                src_sequences_for_transformer = []
+                for j_in_batch in range(batch_curr_src_idx.size(0)): # 遍歷 mini-batch 中的路徑
                     path_elements_embs = []
                     
-                    # 1. 添加最初始源節點嵌入 (CUI_A)
-                    # mem_orig_src_idx_hop 此時是剪枝後的張量
-                    orig_src_idx_val = mem_orig_src_idx_hop[j_path_idx_in_batch].item() if mem_orig_src_idx_hop is not None else -1
-                    if orig_src_idx_val != -1 and orig_src_idx_val in _map_mem_orig_to_local and unique_mem_orig_src_embs is not None:
-                        path_elements_embs.append(unique_mem_orig_src_embs[_map_mem_orig_to_local[orig_src_idx_val]])
-                    else: 
-                        # cand_src_idx_hop 此時是剪枝後的張量
-                        curr_src_idx_val_for_fallback = cand_src_idx_hop[j_path_idx_in_batch].item()
-                        if curr_src_idx_val_for_fallback in _map_curr_src_to_local_for_transformer :
-                             path_elements_embs.append(current_path_src_embs_for_encoding[_map_curr_src_to_local_for_transformer[curr_src_idx_val_for_fallback]])
+                    # 獲取當前路徑的最初始源節點的全局索引 (仍然需要 .item() 進行條件判斷)
+                    orig_src_idx_val_current_path = batch_mem_orig_src_idx[j_in_batch].item() if batch_mem_orig_src_idx is not None else -1
+                    curr_src_idx_val_current_path = batch_curr_src_idx[j_in_batch].item()
 
-                    # 2. 添加第一個關係的嵌入 (Rel1) - 僅當是第二跳且 Rel1 存在時
-                    if running_k_hop == 1 and mem_first_edge_idx_hop is not None:
-                        # mem_first_edge_idx_hop 此時是剪枝後的張量
-                        first_edge_idx_val = mem_first_edge_idx_hop[j_path_idx_in_batch].item()
-                        if first_edge_idx_val != -1: 
-                            if first_edge_idx_val < self.e_encoder.onehot_mat.shape[0]:
-                                first_rel_one_hot = self.e_encoder.onehot_mat[first_edge_idx_val].to(self.device)
-                                projected_first_rel_emb = self.edge_to_node_projection_for_transformer(first_rel_one_hot)
-                                path_elements_embs.append(projected_first_rel_emb)
-                            else: # 索引越界
+
+                    # 1. 添加最初始源節點嵌入 (CUI_A)
+                    added_orig_src = False
+                    if batch_orig_src_embs is not None: # batch_orig_src_embs 已經是 mini-batch 對應的嵌入了
+                        path_elements_embs.append(batch_orig_src_embs[j_in_batch])
+                        added_orig_src = True
+                    else: # 如果是第一跳，batch_mem_orig_src_idx 可能與 batch_curr_src_idx 相同（或其記憶為自身）
+                        # 或者 batch_orig_src_embs 因為某些原因沒有成功獲取
+                        path_elements_embs.append(batch_curr_src_embs[j_in_batch]) # 此時 curr_src 就是最初始源
+                        added_orig_src = True # 視為已添加最初始源（即當前源）
+
+                    # 2. 添加第一個關係的嵌入 (Rel1) - 僅當是第二跳且 Rel1 有效時
+                    if running_k_hop == 1:
+                        if batch_projected_first_rel_embs is not None:
+                            # batch_mem_first_edge_idx[j_in_batch].item() 仍然需要判斷是否為 -1
+                            # 以確定 batch_projected_first_rel_embs[j_in_batch] 是否為有效投影嵌入或零向量
+                            if batch_mem_first_edge_idx[j_in_batch].item() != -1:
+                                path_elements_embs.append(batch_projected_first_rel_embs[j_in_batch])
+                            else: # 無效的 Rel1，添加零向量占位符
                                 path_elements_embs.append(torch.zeros(self.hdim, device=self.device))
-                    
+                        else: # 如果 batch_projected_first_rel_embs 本身就是 None
+                            path_elements_embs.append(torch.zeros(self.hdim, device=self.device))
+
+
                     # 3. 添加中間節點嵌入 (CUI_B) - 僅當是第二跳且與最初始源節點不同時
-                    # cand_src_idx_hop 此時是剪枝後的張量
-                    curr_src_idx_val = cand_src_idx_hop[j_path_idx_in_batch].item()
-                    if running_k_hop == 1 and orig_src_idx_val != -1 and orig_src_idx_val != curr_src_idx_val:
-                         if curr_src_idx_val in _map_curr_src_to_local_for_transformer:
-                            path_elements_embs.append(current_path_src_embs_for_encoding[_map_curr_src_to_local_for_transformer[curr_src_idx_val]])
+                    if running_k_hop == 1:
+                        # 僅當 orig_src 和 curr_src 不同時，curr_src (中間節點) 才作為序列的獨立元素添加
+                        # 如果是第一跳，curr_src 已經在上面作為 "最初始源" 添加了
+                        # 如果 orig_src 因為某些原因沒有被添加到 path_elements_embs (added_orig_src is False)
+                        # 或者 orig_src 和 curr_src 不同，則需要添加 curr_src
+                        if not added_orig_src or \
+                        (orig_src_idx_val_current_path != -1 and \
+                            orig_src_idx_val_current_path != curr_src_idx_val_current_path):
+                            path_elements_embs.append(batch_curr_src_embs[j_in_batch])
                     
                     if path_elements_embs:
                         src_sequences_for_transformer.append(torch.stack(path_elements_embs))
-                    else:
+                    else: # 理論上不應發生，因為至少有一個源節點嵌入
                         src_sequences_for_transformer.append(torch.zeros((1, self.hdim), device=self.device))
-
+                
+                # --- 3. 填充序列並準備 src_b ---
                 if not src_sequences_for_transformer:
-                     src_b = torch.empty(0,0,self.hdim, device=self.device) 
+                    src_b = torch.empty(0,0,self.hdim, device=self.device) 
                 else:
                     src_b = pad_sequence(src_sequences_for_transformer, batch_first=True, padding_value=0.0)
             else: # MLP Encoder Logic
@@ -1459,15 +1616,12 @@ class GraphModel(nn.Module):
 
             # --- 後續的編碼與排序邏輯 ---
             # 準備 combined_tgt_edge_b (這部分需要小心，確保索引 s_ 的應用正確)
-            map_global_tgt_idx_to_local_in_unique = {glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices)}
+            # map_global_tgt_idx_to_local_in_unique = {glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices)}
             
             # cand_tgt_idx_hop[s_] 獲取當前 mini-batch 對應的目標節點的全局索引
             current_batch_tgt_global_indices = cand_tgt_idx_hop[s_]
             # 將這些全局索引轉換為在 unique_tgt_embs 中的局部索引
-            current_batch_tgt_local_indices = torch.tensor(
-                [map_global_tgt_idx_to_local_in_unique[idx.item()] for idx in current_batch_tgt_global_indices],
-                dtype=torch.long, device=self.device
-            )
+            current_batch_tgt_local_indices = map_global_tgt_to_local_tensor[current_batch_tgt_global_indices]
             path_specific_tgt_embs_for_batch = unique_tgt_embs[current_batch_tgt_local_indices]
             
             combined_tgt_edge_b = torch.cat(
@@ -1686,52 +1840,89 @@ class Trainer(nn.Module):
         return torch.tensor(gt_indices, dtype=torch.long, device=self.device)
 
     def compute_bce_loss_for_hop(self, all_paths_info_hop, gt_cuis_str_list_sample):
-        hop_loss = torch.tensor(0.0, device=self.device)
-        if all_paths_info_hop is None or all_paths_info_hop['scores'] is None or \
-           all_paths_info_hop['scores'].numel() == 0 or not gt_cuis_str_list_sample:
+        hop_loss = torch.tensor(0.0, device=self.device) # 1. 初始化損失為0
+
+        # 2. 早期退出條件：如果沒有路徑資訊、沒有評分、或者沒有真實標籤，則無法計算損失
+        if all_paths_info_hop is None or \
+           all_paths_info_hop.get('scores') is None or \
+           all_paths_info_hop['scores'].numel() == 0 or \
+           not gt_cuis_str_list_sample:
             return hop_loss
 
+        # 3. 提取路徑評分和目標CUI索引
         path_scores = all_paths_info_hop['scores'].squeeze(-1) # [num_paths_this_hop]
-        path_target_global_indices = all_paths_info_hop['tgt_idx'] # [num_paths_this_hop] (GLOBAL CUI INDICES)
+        path_target_global_indices = all_paths_info_hop['tgt_idx'] # [num_paths_this_hop] (全局CUI索引)
         
-        gt_global_indices_set = set(self._get_gt_indices_tensor(gt_cuis_str_list_sample).tolist())
-        if not gt_global_indices_set: # No valid GT CUIs for this sample/hop
+        # 4. 準備真實標籤 (Ground Truth)
+        # 將GT CUI字符串列表轉換為全局索引的 Tensor
+        gt_indices_tensor = self._get_gt_indices_tensor(gt_cuis_str_list_sample) 
+        
+        # 5. 聚合評分：針對每個在路徑中出現的 *唯一* 目標CUI，獲取其最高預測評分
+        unique_path_targets_global_indices, inverse_indices = torch.unique(
+            path_target_global_indices, return_inverse=True
+        )
+
+        # 如果沒有唯一路徑目標 (例如，所有路徑都被過濾掉了，或者 cand_tgt_idx_hop 為空導致的)
+        if unique_path_targets_global_indices.numel() == 0:
             return hop_loss
 
-        # Aggregate scores for each unique target CUI index found in paths
-        unique_path_targets_global_indices, inverse_indices = torch.unique(path_target_global_indices, return_inverse=True)
-        
-        # Use scatter_max to get the max score for each unique target CUI index
-        # If torch_scatter not available, use a loop or other PyTorch methods
-        if TORCH_SCATTER_AVAILABLE:
-            # aggregated_scores_for_unique_targets = scatter_max(path_scores, inverse_indices, dim=0, dim_size=unique_path_targets_global_indices.size(0))[0]
-             # scatter_max returns (values, argmax_indices). We only need values.
-             # Fallback if scatter_max is not directly available or has issues with PyTorch versions
-            temp_aggregated_scores = torch.full((unique_path_targets_global_indices.size(0),), float('-inf'), device=self.device, dtype=path_scores.dtype)
-            for i, unique_tgt_idx in enumerate(unique_path_targets_global_indices):
-                mask = (path_target_global_indices == unique_tgt_idx)
-                if torch.any(mask):
-                    temp_aggregated_scores[i] = torch.max(path_scores[mask])
-            aggregated_scores_for_unique_targets = temp_aggregated_scores
-
+        # 使用 torch_scatter (如果可用) 或 fallback 進行聚合
+        if TORCH_SCATTER_AVAILABLE: # TORCH_SCATTER_AVAILABLE 應在類或全局定義
+            # 確保 inverse_indices 的值在 scatter_max 的有效範圍內
+            if unique_path_targets_global_indices.numel() > 0 and \
+               path_scores.numel() > 0 and \
+               inverse_indices.numel() == path_scores.numel():
+                
+                # 檢查 inverse_indices 的最大值是否小於 dim_size
+                if inverse_indices.max().item() < unique_path_targets_global_indices.size(0):
+                    aggregated_scores_for_unique_targets = scatter_max(
+                        path_scores, 
+                        inverse_indices, 
+                        dim=0, 
+                        dim_size=unique_path_targets_global_indices.size(0)
+                    )[0] # scatter_max 返回 (values, argmax_indices)
+                else:
+                    # print(f"警告 (BCE scatter_max): inverse_indices 包含越界值。使用迴圈回退。")
+                    # 執行迴圈回退邏輯 (與 TORCH_SCATTER_AVAILABLE = False 時相同)
+                    temp_aggregated_scores = torch.full((unique_path_targets_global_indices.size(0),), float('-inf'), device=self.device, dtype=path_scores.dtype)
+                    for i_loop_idx, unique_tgt_idx_loop in enumerate(unique_path_targets_global_indices):
+                        mask_loop = (path_target_global_indices == unique_tgt_idx_loop)
+                        if torch.any(mask_loop):
+                            temp_aggregated_scores[i_loop_idx] = torch.max(path_scores[mask_loop])
+                    aggregated_scores_for_unique_targets = temp_aggregated_scores
+            elif unique_path_targets_global_indices.numel() > 0:
+                aggregated_scores_for_unique_targets = torch.full((unique_path_targets_global_indices.size(0),), float('-inf'), device=self.device, dtype=path_scores.dtype)
+            else: # unique_path_targets_global_indices 為空 (理論上已被上面 numel()==0 捕捉)
+                return hop_loss
         else: # Fallback without torch_scatter
-            # print("BCE Fallback: Looped aggregation for scores.")
-            aggregated_scores_for_unique_targets_list = []
-            for unique_tgt_idx in unique_path_targets_global_indices.tolist():
-                mask = (path_target_global_indices == unique_tgt_idx)
-                if torch.any(mask):
-                    aggregated_scores_for_unique_targets_list.append(torch.max(path_scores[mask]))
-                # else: handle case where unique_tgt_idx somehow has no scores (should not happen)
-            if not aggregated_scores_for_unique_targets_list: return hop_loss
-            aggregated_scores_for_unique_targets = torch.stack(aggregated_scores_for_unique_targets_list)
+            temp_aggregated_scores_list = []
+            for unique_tgt_idx_loop in unique_path_targets_global_indices.tolist():
+                mask_loop = (path_target_global_indices == unique_tgt_idx_loop)
+                if torch.any(mask_loop):
+                    temp_aggregated_scores_list.append(torch.max(path_scores[mask_loop]))
+                else: # 如果一個 unique target 實際上沒有對應的路徑分數 (不應發生)
+                    temp_aggregated_scores_list.append(torch.tensor(float('-inf'), device=self.device, dtype=path_scores.dtype))
+            
+            if not temp_aggregated_scores_list: return hop_loss
+            aggregated_scores_for_unique_targets = torch.stack(temp_aggregated_scores_list)
 
-        labels_for_unique_targets = torch.tensor(
-            [1.0 if idx.item() in gt_global_indices_set else 0.0 for idx in unique_path_targets_global_indices],
-            device=self.device
-        )
+        # 6. 為 unique_path_targets_global_indices 生成二元標籤 (0 或 1)
+        if not gt_indices_tensor.numel() > 0: 
+            # 如果沒有 GT，但有預測目標，則所有預測目標的標籤都應為0
+            labels_for_unique_targets = torch.zeros_like(aggregated_scores_for_unique_targets, dtype=torch.float, device=self.device)
+        else:
+            # ## MODIFIED: 使用 torch.isin() 向量化標籤生成
+            is_gt_mask = torch.isin(unique_path_targets_global_indices, gt_indices_tensor)
+            labels_for_unique_targets = is_gt_mask.float() # 將布林掩碼轉換為 0.0 或 1.0
         
-        if aggregated_scores_for_unique_targets.numel() > 0 :
+        # 7. 計算 BCE 損失
+        # 確保 aggregated_scores 和 labels 的形狀和元素數量匹配
+        if aggregated_scores_for_unique_targets.numel() > 0 and \
+           aggregated_scores_for_unique_targets.size(0) == labels_for_unique_targets.size(0):
              hop_loss = self.loss_fn_bce(aggregated_scores_for_unique_targets, labels_for_unique_targets)
+        elif aggregated_scores_for_unique_targets.numel() > 0 : # Labels 數量不匹配 (不應發生)
+            print(f"警告 (BCE Loss): aggregated_scores ({aggregated_scores_for_unique_targets.size(0)}) 和 labels ({labels_for_unique_targets.size(0)}) 數量不匹配。")
+            
         return hop_loss
 
 
@@ -1745,14 +1936,17 @@ class Trainer(nn.Module):
         path_embeddings = all_paths_info_hop['encoded_embeddings'] # [num_paths, hdim]
         path_target_global_indices = all_paths_info_hop['tgt_idx']   # [num_paths] (GLOBAL CUI INDICES)
 
-        gt_global_indices_set = set(self._get_gt_indices_tensor(gt_cuis_str_list_sample).tolist())
-        if not gt_global_indices_set: return triplet_loss
-        
-        positive_indices_mask = torch.tensor(
-            [idx.item() in gt_global_indices_set for idx in path_target_global_indices],
-            dtype=torch.bool, device=self.device
-        )
-        negative_indices_mask = ~positive_indices_mask
+        gt_indices_tensor = self._get_gt_indices_tensor(gt_cuis_str_list_sample) # 返回 Tensor
+
+        if not gt_indices_tensor.numel() > 0: # 如果沒有 GT，則無法區分正負樣本
+            return triplet_loss # triplet_loss 初始化為 0.0
+
+        # ## MODIFIED: 使用 torch.isin() 向量化正樣本掩碼生成
+        if path_target_global_indices.numel() > 0: # 確保有路徑目標可以判斷
+            positive_indices_mask = torch.isin(path_target_global_indices, gt_indices_tensor)
+            negative_indices_mask = ~positive_indices_mask
+        else: # 如果沒有路徑目標，則沒有正負樣本
+            return triplet_loss
 
         positive_embs = path_embeddings[positive_indices_mask]
         negative_embs = path_embeddings[negative_indices_mask]
@@ -2217,11 +2411,11 @@ if __name__ =='__main__':
     hdim = base_encoder_model.config.hidden_size
     nums_of_head = 3 
     top_n = 8 
-    epochs = 1 
+    epochs = 300 
     LR = 1e-5 
     intermediate_loss_flag = True 
     contrastive_flag = True 
-    batch_size = 4 
+    batch_size = 64 
     
     gin_hidden_dim_val = hdim 
     gin_num_layers_val = 2  
@@ -2281,8 +2475,8 @@ if __name__ =='__main__':
         
         
 
-    train_loader_instance = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_mediq_preprocessed, num_workers=6, pin_memory=True)
-    dev_loader_instance = DataLoader(dev_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_preprocessed, num_workers=6, pin_memory=True)
+    train_loader_instance = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_mediq_preprocessed, num_workers=12, pin_memory=True)
+    dev_loader_instance = DataLoader(dev_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_preprocessed, num_workers=12, pin_memory=True)
     print("Dataloaders created.")
 
     print("\n" + "="*30 + "\n STARTING Tensorized Trainer RUN  \n" + "="*30 + "\n")
