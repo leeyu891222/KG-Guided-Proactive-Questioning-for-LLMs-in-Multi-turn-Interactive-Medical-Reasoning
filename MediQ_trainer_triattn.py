@@ -2295,8 +2295,10 @@ if __name__ =='__main__':
     
     CUI_EMBEDDING_FILE = "./drknows/GraphModel_SNOMED_CUI_Embedding.pkl"
     
-    TRAIN_ANNOTATION_FILE = "./MediQ/mediq_train_preprocessed.jsonl"
-    DEV_ANNOTATION_FILE = './MediQ/mediq_dev_preprocessed.jsonl'
+    # TRAIN_ANNOTATION_FILE = "./MediQ/mediq_train_preprocessed.jsonl"
+    # DEV_ANNOTATION_FILE = './MediQ/mediq_dev_preprocessed.jsonl'
+    TRAIN_ANNOTATION_FILE = "./MediQ/mediq_train_annotations_bm25_20.json"
+    DEV_ANNOTATION_FILE = './MediQ/mediq_dev_annotations_bm25_20.json'
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -2387,8 +2389,10 @@ if __name__ =='__main__':
 
     print("\nLoading datasets...")
     try:
-        train_dataset_obj = MediQPreprocessedDataset(TRAIN_ANNOTATION_FILE)
-        dev_dataset_obj = MediQPreprocessedDataset(DEV_ANNOTATION_FILE)
+        # train_dataset_obj = MediQPreprocessedDataset(TRAIN_ANNOTATION_FILE)
+        # dev_dataset_obj = MediQPreprocessedDataset(DEV_ANNOTATION_FILE)
+        train_dataset_obj = MediQAnnotatedDataset(TRAIN_ANNOTATION_FILE, tokenizer)
+        dev_dataset_obj = MediQAnnotatedDataset(DEV_ANNOTATION_FILE, tokenizer)
     except Exception as e:
         print(f"Error loading datasets: {e}"); exit()
         
@@ -2397,8 +2401,10 @@ if __name__ =='__main__':
         
         
 
-    train_loader_instance = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_mediq_preprocessed, num_workers=6, pin_memory=True)
-    dev_loader_instance = DataLoader(dev_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_preprocessed, num_workers=6, pin_memory=True)
+    # train_loader_instance = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_mediq_preprocessed, num_workers=6, pin_memory=True)
+    # dev_loader_instance = DataLoader(dev_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_preprocessed, num_workers=6, pin_memory=True)
+    train_loader_instance = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_mediq_paths, num_workers=6, pin_memory=True)
+    dev_loader_instance = DataLoader(dev_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths, num_workers=6, pin_memory=True)
     print("Dataloaders created.")
 
     print("\n" + "="*30 + "\n STARTING Tensorized Trainer RUN  \n" + "="*30 + "\n")
