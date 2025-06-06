@@ -1,5 +1,15 @@
 import unittest
+import os
+import json
+import tempfile
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import random
+import networkx as nx
+import numpy as np
 from unittest.mock import MagicMock, patch
+
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import numpy as np
@@ -49,11 +59,12 @@ except ImportError:
     
 class MediQAnnotatedDataset(Dataset):
     def __init__(self, annotation_file_path, tokenizer, random_seed=2023, min_facts_for_sampling=2):
+        # ... __init__ 的前半部分與之前相同，無需修改 ...
         print(f"載入並預處理標註數據: {annotation_file_path}")
         self.min_facts_for_sampling = max(2, min_facts_for_sampling)
         self.tokenizer = tokenizer
         self.random = random.Random(random_seed)
-        self.valid_training_samples = [] # 將存儲 (case_id, known_idx, unknown_idx)
+        self.valid_training_samples = [] 
 
         try:
             with open(annotation_file_path, 'r', encoding='utf-8') as f:
@@ -67,7 +78,6 @@ class MediQAnnotatedDataset(Dataset):
 
         num_cases_before_filter = len(all_annotations)
         num_cases_after_min_facts_filter = 0
-        num_valid_pairs_found = 0
 
         for case_id, data in all_annotations.items():
             atomic_facts = data.get("atomic_facts", [])
@@ -79,17 +89,14 @@ class MediQAnnotatedDataset(Dataset):
                 continue
             num_cases_after_min_facts_filter += 1
 
-            # 找出所有存在預計算路徑的 (known_fact_idx, unknown_fact_idx) 對
             for i in range(num_facts):
                 for j in range(num_facts):
-                    if i == j:  # 已知和未知不能是同一個 fact
+                    if i == j:
                         continue
                     
-                    path_key = f"{i}_{j}" # 假設 i 是 known, j 是 unknown
+                    path_key = f"{i}_{j}"
                     if path_key in paths_between_facts and paths_between_facts[path_key]:
-                        # 確保 unknown_fact_idx 对应的 CUI 列表不为空
-                        if facts_cuis[j]: # 如果 unknown fact 有 CUI
-                            # 进一步确保路径的目标CUI至少有一个在unknown fact的CUI列表中
+                        if facts_cuis[j]:
                             has_valid_target_in_path = False
                             for path_data in paths_between_facts[path_key]:
                                 if not path_data or not isinstance(path_data, list): continue
@@ -103,11 +110,9 @@ class MediQAnnotatedDataset(Dataset):
                                     "case_id": case_id,
                                     "guaranteed_known_idx": i,
                                     "guaranteed_unknown_idx": j,
-                                    # "all_case_data": data # 可以選擇是否存儲整個案例數據以避免重複查找
                                 })
-                                num_valid_pairs_found +=1
         
-        self.all_annotations_data = all_annotations # 存儲所有數據，供後續查找
+        self.all_annotations_data = all_annotations
 
         print(f"原始案例數: {num_cases_before_filter}")
         print(f"通過最小事實數 ({self.min_facts_for_sampling}) 和 CUI 長度檢查的案例數: {num_cases_after_min_facts_filter}")
@@ -115,7 +120,6 @@ class MediQAnnotatedDataset(Dataset):
 
         if not self.valid_training_samples:
             print("警告: 預處理後沒有找到任何有效的訓練樣本對。請檢查數據和 `paths_between_facts` 的內容。")
-
 
     def __len__(self):
         return len(self.valid_training_samples)
@@ -126,37 +130,23 @@ class MediQAnnotatedDataset(Dataset):
         guaranteed_known_idx = sample_info["guaranteed_known_idx"]
         guaranteed_unknown_idx = sample_info["guaranteed_unknown_idx"]
         
-        # 從 self.all_annotations_data 中獲取該 case 的完整數據
         data = self.all_annotations_data[case_id]
         atomic_facts = data["atomic_facts"]
         facts_cuis = data["facts_cuis"]
         paths_between_facts = data.get("paths_between_facts", {})
         num_facts = len(atomic_facts)
 
-        # --- 構建已知集和未知集 ---
         known_indices = {guaranteed_known_idx}
-        unknown_indices = {guaranteed_unknown_idx} # 初始未知集只包含這個保證的未知
+        unknown_indices = {guaranteed_unknown_idx}
 
-        # 可選：從剩餘 facts 中隨機添加更多 facts 到已知集或未知集，以增加多樣性
         remaining_indices = list(set(range(num_facts)) - known_indices - unknown_indices)
         self.random.shuffle(remaining_indices)
 
-        # 例如，將剩餘的一半（隨機）加入已知集，另一半加入未知集（如果需要更多未知目標）
-        # 或者更簡單：除了 guaranteed_unknown_idx 之外，其他都作為已知（如果適用）
-        # 為了保證至少有一個確定的 GT 來源，我們先這樣設計：
-        # known_indices 可以擴展，但 unknown_indices 的 GT 主要來自 guaranteed_unknown_idx
-
-        # 示例：將一部分 remaining_indices 加入 known_indices
         if remaining_indices:
             num_additional_known = self.random.randint(0, len(remaining_indices))
             known_indices.update(remaining_indices[:num_additional_known])
-            # 剩下的可以加入 unknown_indices，或者作為模型的 "distractor" / "context"
-            # 如果我們只關心從 known_indices 到 guaranteed_unknown_idx 的路徑，則其他 unknown 可以忽略
-            # 為了與方案一的目標一致（找到從已知到任何未知的路徑），我們應該將剩餘的也加入 unknown_indices
             unknown_indices.update(remaining_indices[num_additional_known:])
 
-
-        # --- 準備模型輸入 (Input Text 和 Known CUIs) ---
         known_texts_list = [atomic_facts[i] for i in sorted(list(known_indices))]
         known_texts_combined = " ".join(known_texts_list) if known_texts_list else "N/A"
 
@@ -171,46 +161,14 @@ class MediQAnnotatedDataset(Dataset):
             if isinstance(current_fact_cuis, list):
                 known_cuis_list_flat.extend(current_fact_cuis)
         known_cuis_list_unique = list(set(known_cuis_list_flat))
-
-        # --- 從 guaranteed_known_idx 到 guaranteed_unknown_idx 提取 GT CUIs ---
-        # 由於我們是從確保有路徑的 (guaranteed_known_idx, guaranteed_unknown_idx) 開始的，
-        # 所以這裡 paths_for_this_guaranteed_pair 幾乎一定會有內容。
+        
+        # ## MODIFIED: 創建三個獨立的集合來儲存不同類型的 GT
         hop1_target_cuis_set = set()
         hop2_target_cuis_set = set()
+        intermediate_target_cuis_set = set() # ## ADDED
         
-        # 我們也可以考慮從所有 known_indices 到所有 unknown_indices 的路徑
-        # 但為了確保 __getitem__ 總能基於 "guaranteed" pair 產生 GT，我們先專注於這個核心連接
-        # 然後可以選擇性地加入其他 known 到其他 unknown 的 GT
-        
-        primary_path_key = f"{guaranteed_known_idx}_{guaranteed_unknown_idx}"
-        paths_for_this_guaranteed_pair = paths_between_facts.get(primary_path_key, [])
-
-        if not paths_for_this_guaranteed_pair:
-            # 這種情況理論上不應該發生，因為 self.valid_training_samples 的構建已經篩選了
-            # 但作為防禦性編程，如果發生了，返回 None
-            print(f"嚴重警告: 案例 {case_id}, 預期有路徑的 guaranteed_pair ({guaranteed_known_idx}_{guaranteed_unknown_idx}) 未找到路徑！")
-            return None
-
-        for path_data in paths_for_this_guaranteed_pair:
-            if not path_data or not isinstance(path_data, list): continue
-            path_len = len(path_data)
-            target_cui_in_path = path_data[-1]
-            is_valid_cui = isinstance(target_cui_in_path, str) and target_cui_in_path.startswith('C')
-
-            if is_valid_cui and isinstance(facts_cuis[guaranteed_unknown_idx], list) and \
-               target_cui_in_path in facts_cuis[guaranteed_unknown_idx]:
-                if path_len == 3:
-                    hop1_target_cuis_set.add(target_cui_in_path)
-                    hop2_target_cuis_set.add(target_cui_in_path)
-                elif path_len == 5:
-                    hop2_target_cuis_set.add(target_cui_in_path)
-
-        # 可選：遍歷所有 known_indices 到所有 (除了 guaranteed_unknown_idx 之外的) unknown_indices
-        # 以增加更多樣的 GT，但要確保這不會導致 GT 經常為空
         for k_idx in known_indices:
             for u_idx in unknown_indices:
-                if u_idx == guaranteed_unknown_idx and k_idx == guaranteed_known_idx: # 已經處理過 guaranteed pair
-                    continue
                 path_key_optional = f"{k_idx}_{u_idx}"
                 if path_key_optional in paths_between_facts:
                     for path_data in paths_between_facts[path_key_optional]:
@@ -218,18 +176,24 @@ class MediQAnnotatedDataset(Dataset):
                         path_len = len(path_data)
                         target_cui_in_path = path_data[-1]
                         is_valid_cui = isinstance(target_cui_in_path, str) and target_cui_in_path.startswith('C')
+                        
                         if is_valid_cui and isinstance(facts_cuis[u_idx], list) and \
                            target_cui_in_path in facts_cuis[u_idx]:
-                            if path_len == 3:
-                                hop1_target_cuis_set.add(target_cui_in_path) # 加入到set中自然去重
-                                hop2_target_cuis_set.add(target_cui_in_path)
-                            elif path_len == 5:
-                                hop2_target_cuis_set.add(target_cui_in_path)
+                            
+                            # ## MODIFIED: 根據路徑長度將目標 CUI 分配到正確的集合
+                            if path_len == 3: # 1-hop path
+                                hop1_target_cuis_set.add(target_cui_in_path)
+                            elif path_len == 5: # 2-hop path
+                                intermediate_cui = path_data[2] # 中間節點
+                                intermediate_target_cuis_set.add(intermediate_cui) # ## ADDED
+                                hop2_target_cuis_set.add(target_cui_in_path) # 最終目標
         
-        # 最終檢查，如果經過所有努力，hop2 依然是空的（理論上不應發生，因為 guaranteed pair）
-        if not hop2_target_cuis_set:
-            # print(f"警告: 案例 {case_id} (索引 {index}) 即使使用 guaranteed_pair，hop2_target_cuis 仍為空。")
-            return None # 這種情況值得調查
+        # ## MODIFIED: 修改返回 None 的條件。
+        # 現在，一個樣本被視為無效，如果它連一個 1-hop 或 2-hop 的 GT 都沒有。
+        # 訓練器將決定如何使用這些GT。例如，如果只訓練2-hop，那麼 hop2_target_cuis 為空就可能是個問題。
+        # 為了通用性，我們只要至少有一個GT就返回。
+        if not hop1_target_cuis_set and not hop2_target_cuis_set:
+            return None
 
         return {
             "case_id": case_id,
@@ -238,40 +202,171 @@ class MediQAnnotatedDataset(Dataset):
             "input_text_tks": input_text_tks,
             "known_cuis": known_cuis_list_unique,
             "hop1_target_cuis": list(hop1_target_cuis_set),
-            "hop2_target_cuis": list(hop2_target_cuis_set)
+            "hop2_target_cuis": list(hop2_target_cuis_set),
+            "intermediate_target_cuis": list(intermediate_target_cuis_set), # ## ADDED
         }
 
 
-# --- 修改後的 Collate Function ---
 def collate_fn_mediq_paths(batch):
     valid_items_in_batch = [item for item in batch if item is not None]
     if not valid_items_in_batch:
         return None
+    
+    # 提取所有鍵
     case_ids = [item['case_id'] for item in valid_items_in_batch]
-    # known_indices = [item['known_indices'] for item in valid_items_in_batch]
-    # unknown_indices = [item['unknown_indices'] for item in valid_items_in_batch]
     input_ids = [item['input_text_tks']['input_ids'] for item in valid_items_in_batch]
     attention_mask = [item['input_text_tks']['attention_mask'] for item in valid_items_in_batch]
     known_cuis = [item['known_cuis'] for item in valid_items_in_batch]
     hop1_target_cuis = [item['hop1_target_cuis'] for item in valid_items_in_batch]
     hop2_target_cuis = [item['hop2_target_cuis'] for item in valid_items_in_batch]
+    intermediate_target_cuis = [item['intermediate_target_cuis'] for item in valid_items_in_batch] # ## ADDED
 
-    input_ids_padded = pad_sequence(input_ids, batch_first=True, padding_value=0)
-    attention_mask_padded = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+    # 填充
+    input_ids_padded = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
+    attention_mask_padded = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
 
     return {
         "case_id": case_ids,
-        # "known_indices": known_indices,
-        # "unknown_indices": unknown_indices,
         "input_text_tks_padded": {
             "input_ids": input_ids_padded,
             "attention_mask": attention_mask_padded
         },
         "known_cuis": known_cuis,
         "hop1_target_cuis": hop1_target_cuis,
-        "hop2_target_cuis": hop2_target_cuis
+        "hop2_target_cuis": hop2_target_cuis,
+        "intermediate_target_cuis": intermediate_target_cuis, # ## ADDED
     }
     
+    
+    
+class MediQPreprocessedDataset(Dataset):
+    def __init__(self, preprocessed_file_path, tokenizer_for_padding_info=None):
+        """
+        初始化 Dataset.
+        Args:
+            preprocessed_file_path (str): 預處理後的 .jsonl 檔案路徑。
+            tokenizer_for_padding_info (optional): Tokenizer實例，主要用於獲取 pad_token_id。
+                                                    如果預處理時已padding到固定長度，則可能不需要。
+                                                    但如果collate_fn需要動態padding，知道pad_id有時有用。
+                                                    在這個實現中，我們假設預處理時已經padding。
+        """
+        print(f"開始從預處理文件載入數據: {preprocessed_file_path}")
+        self.samples = []
+        try:
+            with open(preprocessed_file_path, 'r', encoding='utf-8') as f:
+                for line in tqdm(f, desc="正在載入預處理樣本"):
+                    try:
+                        self.samples.append(json.loads(line.strip()))
+                    except json.JSONDecodeError:
+                        print(f"警告: 無法解析行: {line.strip()}")
+        except FileNotFoundError:
+            print(f"錯誤：找不到預處理文件 {preprocessed_file_path}。")
+            raise
+        except Exception as e:
+            print(f"載入預處理文件時發生錯誤: {e}")
+            raise
+        
+        if not self.samples:
+            print("警告: Dataset 初始化後為空。請檢查預處理文件。")
+        else:
+            print(f"成功載入 {len(self.samples)} 個預處理樣本。")
+            # 檢查第一個樣本的結構 (可選)
+            # print(f"第一個樣本的鍵: {self.samples[0].keys()}")
+
+        # 如果您的 collate_fn 需要 tokenizer 的 pad_token_id，可以在這裡保存
+        # self.pad_token_id = tokenizer_for_padding_info.pad_token_id if tokenizer_for_padding_info else 0
+
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        """
+        獲取一個預處理好的樣本並將其轉換為 PyTorch 張量。
+        """
+        sample_data = self.samples[index]
+        
+        # 從 sample_data 中提取各個部分
+        # 預處理腳本應該已經將 tokenized_input_ids 和 tokenized_attention_mask 
+        # 存儲為整數列表，並且已經 padding 到了固定長度 (例如 512)
+        
+        input_ids = torch.tensor(sample_data["tokenized_input_ids"], dtype=torch.long)
+        attention_mask = torch.tensor(sample_data["tokenized_attention_mask"], dtype=torch.long)
+        
+        # known_cuis, hop1_target_cuis, hop2_target_cuis, intermediate_target_cuis
+        # 這些是 CUI 字符串列表，在 Trainer 的 forward_per_batch 中會被使用
+        # Dataset 層面不需要將它們轉換為索引，因為 Trainer 會處理
+        known_cuis = sample_data["known_cuis"]
+        hop1_target_cuis = sample_data["hop1_target_cuis"]
+        hop2_target_cuis = sample_data["hop2_target_cuis"]
+        intermediate_target_cuis = sample_data["intermediate_target_cuis"]
+        
+        # 如果您在預處理時還保存了 case_id 或其他元數據，也可以在這裡一併返回
+        case_id = sample_data.get("case_id", f"sample_{index}") 
+        # known_indices = sample_data.get("known_indices", []) # 如果需要
+        # unknown_indices = sample_data.get("unknown_indices", []) # 如果需要
+
+        return {
+            "case_id": case_id,
+            # "known_indices": known_indices, # 可選
+            # "unknown_indices": unknown_indices, # 可選
+            "input_text_tks_padded": { # collate_fn 將直接使用這些已是Tensor的數據
+                "input_ids": input_ids,
+                "attention_mask": attention_mask
+            },
+            "known_cuis": known_cuis, # List[str]
+            "hop1_target_cuis": hop1_target_cuis, # List[str]
+            "hop2_target_cuis": hop2_target_cuis, # List[str]
+            "intermediate_target_cuis": intermediate_target_cuis # List[str]
+        }
+
+# --- 您的 collate_fn_mediq_paths 函數 (用於 DataLoader) ---
+# 這個 collate_fn 現在接收的批次中的每個 item，其 'input_text_tks_padded' 
+# 已經是包含正確padding的張量了。所以 collate_fn 主要是將這些張量 stack 起來。
+def collate_fn_mediq_preprocessed(batch):
+    # batch 是一個列表，其中每個元素是 __getitem__ 返回的字典
+    if not batch: # 如果批次為空 (例如，所有樣本都被過濾了，儘管在這個 Dataset 中不應該發生)
+        return None
+
+    # 從批次中的第一個有效樣本檢查鍵 (假設所有樣本結構一致)
+    # valid_items_in_batch = [item for item in batch if item is not None] # 理論上不應有None
+    # if not valid_items_in_batch: return None
+    # first_item = valid_items_in_batch[0]
+    first_item = batch[0]
+
+
+    collated_batch = {}
+    keys_to_stack = [] # 需要堆疊成批次張量的鍵
+    keys_as_list = []  # 保持為列表的列表的鍵
+
+    if 'input_text_tks_padded' in first_item and \
+       isinstance(first_item['input_text_tks_padded'], dict) and \
+       'input_ids' in first_item['input_text_tks_padded']:
+        keys_to_stack.append('input_text_tks_padded') # 特殊處理這個嵌套字典
+    
+    for key in first_item.keys():
+        if key != 'input_text_tks_padded' and isinstance(first_item[key], list):
+            # 像 known_cuis, hop1_target_cuis 等是 CUI 字符串列表，它們應該保持為列表的列表
+            keys_as_list.append(key)
+        elif key != 'input_text_tks_padded' and isinstance(first_item[key], str): # 例如 case_id
+            keys_as_list.append(key)
+        # 其他類型的數據，如果需要特殊處理，可以在這裡添加邏輯
+
+    for key in keys_as_list:
+        collated_batch[key] = [item[key] for item in batch]
+
+    if 'input_text_tks_padded' in keys_to_stack:
+        input_ids_list = [item['input_text_tks_padded']['input_ids'] for item in batch]
+        attention_mask_list = [item['input_text_tks_padded']['attention_mask'] for item in batch]
+        
+        # 因為 __getitem__ 返回的 input_ids 和 attention_mask 已經是 padding 好的固定長度張量
+        # 所以這裡可以直接用 torch.stack
+        collated_batch['input_text_tks_padded'] = {
+            "input_ids": torch.stack(input_ids_list, dim=0),
+            "attention_mask": torch.stack(attention_mask_list, dim=0)
+        }
+    
+    return collated_batch
 
 
 # ====================== gnn_utils ===================
@@ -483,6 +578,7 @@ def retrieve_neighbors_paths_no_self_tensorized(
 
 
 
+
 # Graph retriever utils 
 def project_cui_to_vocab(all_paths_df, cui_vocab):
     vocab_idx = []
@@ -542,135 +638,18 @@ def prune_paths(input_text_vec, cand_neighbors_vs, cand_neighbors_list, threshol
 # ====================== gnn  ===================
 
 class CuiEmbedding(object):
-    """
-    Loads pre-computed CUI embeddings from a pickle file.
-    Handles values that are numpy.ndarray of shape (1, embedding_dim).
-    """
-    def __init__(self, embedding_file_path, device=torch.device('cpu')):
-        print(f"載入真實 CUI 嵌入從: {embedding_file_path}")
-        try:
-            with open(embedding_file_path, 'rb') as f:
-                self.raw_data = pickle.load(f) # CUI_str -> numpy.ndarray (1,768)
-            print(f"成功載入 {len(self.raw_data)} 個 CUI 嵌入。")
-        except FileNotFoundError:
-            print(f"錯誤：找不到 CUI 嵌入文件 {embedding_file_path}。")
-            raise
-        except Exception as e:
-            print(f"載入 CUI 嵌入文件時發生錯誤: {e}")
-            raise
-        
+    def __init__(self, embedding_dict, hdim, device):
+        self.data = {
+            cui: torch.tensor(emb_val, dtype=torch.float, device=device).squeeze()
+            for cui, emb_val in embedding_dict.items()
+        }
+        self.embedding_dim = hdim
         self.device = device
-        self.data = {} # 將存儲 CUI_str -> torch.Tensor [embedding_dim]
-        self.embedding_dim = None
-
-        if not self.raw_data:
-            print("警告: 載入的 CUI 嵌入數據為空。")
-            return
-
-        # Convert loaded embeddings to tensors on the target device
-        # and reshape from (1, 768) to (768)
-        for cui, emb_array in self.raw_data.items():
-            if not isinstance(cui, str):
-                print(f"警告: 發現非字串类型的 CUI key '{cui}' ({type(cui)})，已跳過。")
-                continue
-
-            if isinstance(emb_array, np.ndarray):
-                if emb_array.shape == (1, 768): # 檢查形狀是否如您所述
-                    if self.embedding_dim is None:
-                        self.embedding_dim = emb_array.shape[1]
-                    elif self.embedding_dim != emb_array.shape[1]:
-                        print(f"警告: CUI '{cui}' 的嵌入維度 ({emb_array.shape[1]}) 與之前 ({self.embedding_dim}) 不符，已跳過。")
-                        continue
-                    
-                    # 轉換為 Tensor, squeeze, 並移動到設備
-                    self.data[cui] = torch.from_numpy(emb_array).float().squeeze(0).to(self.device)
-                else:
-                    print(f"警告: CUI '{cui}' 的 NumPy 嵌入形狀 ({emb_array.shape}) 不是預期的 (1, 768)，已跳過。")
-                    continue
-            elif isinstance(emb_array, torch.Tensor): # 如果 pkl 中直接存的是 Tensor
-                if emb_array.shape == (1, 768) or emb_array.shape == (768,):
-                    if self.embedding_dim is None:
-                        self.embedding_dim = emb_array.shape[-1]
-                    elif self.embedding_dim != emb_array.shape[-1]:
-                        print(f"警告: CUI '{cui}' 的 Tensor 嵌入維度 ({emb_array.shape[-1]}) 與之前 ({self.embedding_dim}) 不符，已跳過。")
-                        continue
-                    
-                    self.data[cui] = emb_array.float().reshape(-1).to(self.device) # Reshape to [768]
-                else:
-                    print(f"警告: CUI '{cui}' 的 Tensor 嵌入形狀 ({emb_array.shape}) 不是預期的 (1, 768) 或 (768,)，已跳過。")
-                    continue
-            else:
-                print(f"警告: CUI '{cui}' 的嵌入格式未知 ({type(emb_array)})，已跳過。")
-                continue
-        
-        if not self.data:
-            print("警告: 沒有成功轉換任何 CUI 嵌入。請檢查 pkl 檔案內容和格式。")
-        elif self.embedding_dim is None and self.data: # Should have been set if data exists
-             # Fallback: try to infer from first item if not set but data exists (should not happen with current logic)
-             self.embedding_dim = next(iter(self.data.values())).shape[0]
-
-
     def encode(self, cui_str_list: list):
-        """
-        Encodes a list of CUI strings into their embedding tensors.
-        Returns a tensor of shape [len(cui_str_list_found), embedding_dim].
-        Handles missing CUIs by returning zero vectors.
-        """
-        embeddings_list = []
-        if self.embedding_dim is None: # 如果没有任何有效嵌入被加载
-            print("錯誤: CuiEmbedding 未能確定嵌入維度。無法編碼。")
-            # 返回一个明确表示错误的形状，或者根据期望的hdim创建一个空的
-            # 假设下游期望一个hdim，即使这里无法确定，也应该返回一个有意义的空tensor
-            # 但更安全的是，如果embedding_dim未定义，表明初始化失败。
-            # 理想情况下，如果__init__后self.data为空，self.embedding_dim也应为None
-            # 这里的hdim_fallback仅用于避免在encode中直接崩溃，但表示了更深层的问题
-            hdim_fallback = 768 # 或者从一个配置中获取
-            print(f"警告: 在 encode 中回退到 hdim={hdim_fallback} 因为 self.embedding_dim 未设置。")
-            for cui_str in cui_str_list: # 即使无法查找，也为每个请求的CUI生成占位符
-                 embeddings_list.append(torch.zeros(hdim_fallback, device=self.device))
-            if not embeddings_list:
-                 return torch.empty(0, hdim_fallback, device=self.device)
-            return torch.stack(embeddings_list)
-
-
-        for cui_str in cui_str_list:
-            emb = self.data.get(cui_str)
-            if emb is not None:
-                # 確保 emb 是一維的 [embedding_dim]
-                if emb.dim() == 1 and emb.shape[0] == self.embedding_dim:
-                    embeddings_list.append(emb)
-                else:
-                    print(f"警告: CUI '{cui_str}' 的內部存儲嵌入形狀異常 ({emb.shape})，期望 ({self.embedding_dim},)。使用零向量。")
-                    embeddings_list.append(torch.zeros(self.embedding_dim, device=self.device))
-            else:
-                # print(f"警告: CUI '{cui_str}' 在嵌入字典中未找到。使用零向量代替。")
-                embeddings_list.append(torch.zeros(self.embedding_dim, device=self.device))
-
-        if not embeddings_list:
-            return torch.empty(0, self.embedding_dim, device=self.device)
-        
-        return torch.stack(embeddings_list) # 返回 [N, embedding_dim]
-
+        return torch.stack([self.data.get(c, torch.zeros(self.embedding_dim, device=self.device)) for c in cui_str_list])
     def to(self, device):
         self.device = device
-        # 重新處理 self.raw_data 以確保所有 Tensor 都移動到新設備
-        new_data_on_device = {}
-        if hasattr(self, 'raw_data') and self.raw_data: # 檢查 raw_data 是否存在且非空
-            for cui, emb_array in self.raw_data.items():
-                if not isinstance(cui, str): continue
-
-                if isinstance(emb_array, np.ndarray) and emb_array.shape == (1, self.embedding_dim if self.embedding_dim else 768):
-                    new_data_on_device[cui] = torch.from_numpy(emb_array).float().squeeze(0).to(self.device)
-                elif isinstance(emb_array, torch.Tensor) and (emb_array.shape == (1, self.embedding_dim if self.embedding_dim else 768) or emb_array.shape == (self.embedding_dim if self.embedding_dim else 768,)):
-                    new_data_on_device[cui] = emb_array.float().reshape(-1).to(self.device)
-                # else: # 跳過格式不符的
-            self.data = new_data_on_device
-        else: # 如果 raw_data 為空或不存在，則嘗試移動 self.data 中的現有 Tensor (如果有的話)
-            current_data_temp = self.data.copy() # 複製以避免在迭代時修改
-            self.data = {}
-            for cui, emb_tensor in current_data_temp.items():
-                 self.data[cui] = emb_tensor.to(self.device)
-
+        self.data = {c: emb.to(device) for c, emb in self.data.items()}
         return self
 
 
@@ -705,7 +684,6 @@ class EdgeOneHot(object): # Using the dynamic one from user's code
         clamped_indices = torch.clamp(edge_indices_tensor, 0, self.num_edge_types - 1)
         
         return self.onehot_mat[clamped_indices]
-
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -818,50 +796,11 @@ class NodeAggregateGIN(nn.Module):
                     transformed_msg = F.relu(self.edge_transform_linear(combined_neighbor_edge_feat))
                     aggregated_msgs[src_local_idx] += transformed_msg.squeeze(0)
         else:
-            # Efficient aggregation using torch_scatter
-            # 1. Combine target node features and edge features for all paths
-            combined_neighbor_edge_feats = torch.cat((path_target_node_features, path_edge_features), dim=-1)
             
-            # 2. Transform these combined features (message from neighbor+edge)
-            # Output shape: [total_paths_from_these_srcs, hidden_dim]
+            combined_neighbor_edge_feats = torch.cat((path_target_node_features, path_edge_features), dim=-1)
+                     
             transformed_messages = F.relu(self.edge_transform_linear(combined_neighbor_edge_feats))
             
-            # 3. Aggregate messages for each source node
-            # We need to map global `path_source_indices_global` to local indices [0, num_unique_src-1]
-            # This mapping should align with `x_src_unique`.
-            # `unique_src_to_process_indices` gives the global indices of nodes in `x_src_unique`.
-            # We need to find where each `path_source_indices_global` entry falls in `unique_src_to_process_indices`.
-            
-            # A simple way if unique_src_to_process_indices is sorted and path_source_indices_global contains its elements:
-            # (This assumes path_source_indices_global are already mapped or can be mapped to 0..N-1 indices for scatter)
-            # For scatter, the `index` argument should be local indices for the output tensor.
-            
-            # Let's create the local scatter_index:
-            # map_global_to_local_idx = {global_idx.item(): i for i, global_idx in enumerate(unique_src_to_process_indices)}
-            # scatter_index = torch.tensor(
-            #     [map_global_to_local_idx[glob_idx.item()] for glob_idx in path_source_indices_global],
-            #     dtype=torch.long, device=self.device
-            # )
-            # --- More robust way to get scatter_index ---
-            # Create a "compressed" version of path_source_indices_global
-            # Example: unique_src_to_process_indices = [10, 20, 30] (global IDs)
-            #          path_source_indices_global = [10, 20, 10, 30, 20] (global IDs)
-            # We want scatter_index = [0, 1, 0, 2, 1] (local IDs relative to unique_src_to_process_indices)
-            # This can be achieved using searchsorted if unique_src_to_process_indices is sorted.
-            # Or by building a mapping.
-
-            # Assuming unique_src_to_process_indices is sorted for searchsorted to work efficiently
-            # If not, sort it and remember the inverse permutation if original order matters for x_src_unique.
-            # For simplicity, let's assume unique_src_to_process_indices directly corresponds to the 0..N-1 order of x_src_unique.
-            # This means path_source_indices_global should already be local indices [0, num_unique_src-1]
-            # for scatter_add's `index` argument.
-            # If path_source_indices_global are still global, they need to be mapped.
-
-            # Let's refine this: `GraphModel.one_iteration` should prepare a `scatter_src_index`
-            # that directly maps paths to the 0..N-1 indices of `x_src_unique`.
-            # For this example, let's assume `path_source_indices_global` IS this scatter_index.
-            # (This means GraphModel needs to prepare it correctly based on map_src_idx_to_unique_emb_idx)
-
             if path_source_indices_global.max() >= x_src_unique.size(0):
                  print(f"Error: scatter index max {path_source_indices_global.max()} out of bounds for dim_size {x_src_unique.size(0)}")
                  # Handle error or return
@@ -1068,6 +1007,57 @@ class GraphModel(nn.Module):
         self.g_tensorized = preprocess_graph_to_tensors(g_nx) # Preprocess NX graph
         self.n_encoder_lookup = cui_embedding_lookup # For string CUI to embedding
         self.device = device
+        
+        
+        num_graph_nodes = self.g_tensorized['num_nodes']
+        idx_to_cui_map_for_init = self.g_tensorized['idx_to_cui']
+
+        all_embeddings_list = []
+        found_count = 0
+        if self.n_encoder_lookup.embedding_dim is None and num_graph_nodes > 0:
+            # 嘗試從第一個有效CUI推斷維度，如果CuiEmbedding的dim未設置
+            # 這是一個回退，理想情況下CuiEmbedding.__init__應能確定dim
+            first_valid_cui_for_dim_check = idx_to_cui_map_for_init.get(0)
+            if first_valid_cui_for_dim_check:
+                temp_emb_for_dim_check = self.n_encoder_lookup.encode([first_valid_cui_for_dim_check])
+                if temp_emb_for_dim_check.numel() > 0:
+                    self.hdim = temp_emb_for_dim_check.shape[-1] # 更新hdim以匹配實際嵌入維度
+                    print(f"GraphModel: hdim 已根據實際嵌入更新為 {self.hdim}")
+
+
+        print(f"GraphModel: 正在為 {num_graph_nodes} 個節點創建全局嵌入矩陣...")
+        for i in range(num_graph_nodes):
+            cui_str = idx_to_cui_map_for_init.get(i)
+            if cui_str is not None:
+                # CuiEmbedding.encode 返回 [1, hdim] (如果輸入是列表) 或 [hdim]
+                # 我們需要確保是一致的 [hdim]
+                emb_tensor = self.n_encoder_lookup.encode([cui_str]) # 輸入列表以獲得批次輸出
+                if emb_tensor.numel() > 0:
+                    all_embeddings_list.append(emb_tensor.squeeze(0)) # 移除批次維度
+                    found_count += 1
+                else: # CUI存在於圖中但不在嵌入字典中
+                    print(f"警告: CUI '{cui_str}' (索引 {i}) 在圖中但未找到其嵌入，將使用零向量。")
+                    all_embeddings_list.append(torch.zeros(self.hdim, device=self.device))
+            else: # 理論上不應發生，因為 idx_to_cui_map 應包含所有 0 到 num_nodes-1 的索引
+                print(f"警告: 全局CUI索引 {i} 未在 idx_to_cui_map 中找到，將使用零向量。")
+                all_embeddings_list.append(torch.zeros(self.hdim, device=self.device))
+
+        if all_embeddings_list:
+            self.global_cui_embedding_matrix = torch.stack(all_embeddings_list).to(self.device)
+            print(f"GraphModel: 全局嵌入矩陣創建完畢，形狀: {self.global_cui_embedding_matrix.shape}，找到 {found_count}/{num_graph_nodes} 個嵌入。")
+        else: # 如果圖中沒有節點，或者所有節點都沒有嵌入
+            print(f"GraphModel: 未能創建全局嵌入矩陣 (可能是圖中無節點或無嵌入)。")
+            self.global_cui_embedding_matrix = torch.empty(0, self.hdim, device=self.device)
+
+        # 將 global_cui_embedding_matrix 註冊為緩衝區，使其隨模型移動到不同設備，且不被視為可訓練參數
+        self.register_buffer('global_cui_embedding_matrix_buffer', self.global_cui_embedding_matrix)
+        # 在使用時，可以用 self.global_cui_embedding_matrix_buffer 替代 self.global_cui_embedding_matrix
+        # 或者在 __init__ 結束時 self.global_cui_embedding_matrix = self.global_cui_embedding_matrix_buffer
+                
+        
+        
+        
+        
         # Edge encoder needs the tensorized graph's edge_to_idx for dynamic mapping
         # Or, if EdgeOneHot is modified to take graph_nx and build its own mapping:
         self.e_encoder = EdgeOneHot(graph=g_nx, device=self.device) # Assumes EdgeOneHot can handle NX graph
@@ -1094,7 +1084,7 @@ class GraphModel(nn.Module):
             self.p_ranker = TriAttnFlatPathRanker(hdim)
 
         self.k_hops = num_hops
-        self.path_per_batch_size = 4096
+        self.path_per_batch_size = 256
         self.top_n = top_n
         self.cui_weights_dict = cui_weights_dict if cui_weights_dict else {}
         self.hdim = hdim # Store hdim for use
@@ -1128,39 +1118,22 @@ class GraphModel(nn.Module):
         
 
     def _get_embeddings_by_indices(self, cui_indices_tensor):
-        """Helper to get embeddings for a tensor of CUI indices."""
+        """
+        直接從預存的全局嵌入矩陣中通過索引獲取嵌入。
+        Args:
+            cui_indices_tensor (torch.Tensor): 包含全局CUI索引的1D Tensor。
+        Returns:
+            torch.Tensor: 形狀為 [len(cui_indices_tensor), hdim] 的嵌入張量。
+        """
         if cui_indices_tensor is None or cui_indices_tensor.numel() == 0:
-            return torch.tensor([], device=self.device) # Return empty tensor on device
-        
-        # Convert indices back to CUI strings for lookup (inefficient, but uses existing n_encoder_lookup)
-        # Ideal: n_encoder_lookup.encode_by_idx(cui_indices_tensor)
-        idx_to_cui_map = self.g_tensorized['idx_to_cui']
-        cui_strings = [idx_to_cui_map.get(idx.item()) for idx in cui_indices_tensor]
-        
-        # Filter out None if any index was not in map (should not happen if indices are from graph)
-        valid_cui_strings = [s for s in cui_strings if s is not None]
-        if not valid_cui_strings:
-            return torch.tensor([], device=self.device)
-            
-        # This will return a tensor of shape [num_valid_cuis, 1, hdim] if encode expects list
-        # or [num_valid_cuis, hdim] if it handles batching.
-        # CuiEmbedding.encode returns [N, 1, D], so squeeze later.
-        try:
-            embeddings = self.n_encoder_lookup.encode(valid_cui_strings).to(self.device) # Ensure on device
-            # We need to map these back to the original order of cui_indices_tensor if some were invalid
-            # For now, assume all indices map to valid CUIs and are found by encode
-            if len(valid_cui_strings) != cui_indices_tensor.numel():
-                 print(f"Warning: Some CUI indices could not be mapped or embedded. Original: {cui_indices_tensor.numel()}, Valid: {len(valid_cui_strings)}")
-                 # This part is tricky: how to create a tensor of correct size with zeros for missing?
-                 # For simplicity, we proceed with only valid embeddings. This might break downstream if sizes don't match.
-                 # A robust solution would involve creating a zero tensor and filling it.
-            return embeddings.squeeze(1) # Shape [N, D]
-        except KeyError as e:
-            print(f"KeyError during embedding lookup in _get_embeddings_by_indices: {e}")
-            return torch.tensor([], device=self.device)
-        except Exception as e:
-            print(f"Unexpected error in _get_embeddings_by_indices: {e}")
-            return torch.tensor([], device=self.device)
+            return torch.empty(0, self.hdim, device=self.device) # 返回正確形狀的空張量
+
+        # 確保索引在有效範圍內 (可選，但推薦)
+        # clamped_indices = torch.clamp(cui_indices_tensor, 0, self.global_cui_embedding_matrix.size(0) - 1)
+        # return self.global_cui_embedding_matrix[clamped_indices]
+
+        # 或者，假設傳入的 cui_indices_tensor 總是有效的
+        return self.global_cui_embedding_matrix[cui_indices_tensor]
 
 
     def one_iteration(self,
@@ -1226,14 +1199,9 @@ class GraphModel(nn.Module):
             local_indices_for_mem_orig_src = torch.arange(unique_mem_orig_src_indices.numel(), device=self.device)
             map_global_mem_orig_src_to_local_tensor[unique_mem_orig_src_indices] = local_indices_for_mem_orig_src
             
-        map_global_src_idx_to_local_in_unique = {
-            glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_src_indices)
-        }
+        # map_global_src_idx_to_local_in_unique = {glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_src_indices)}
         # This scatter_index maps each path's global source CUI to its 0..N-1 index within unique_hop_src_indices
-        scatter_src_index_for_gin_agg = torch.tensor(
-            [map_global_src_idx_to_local_in_unique[glob_idx.item()] for glob_idx in cand_src_idx_hop],
-            dtype=torch.long, device=self.device
-        )
+        scatter_src_index_for_gin_agg = map_global_src_to_local_tensor[cand_src_idx_hop]
 
         # Get edge embeddings for all paths
         # EdgeOneHot.Lookup expects list of labels, convert cand_edge_idx_hop back to labels
@@ -1300,7 +1268,7 @@ class GraphModel(nn.Module):
             current_path_src_embs_for_encoding = updated_src_embs_from_gin
             # print(f"GIN updated src embs shape: {current_path_src_embs_for_encoding.shape}")
             
-        pruning_threshold_count = 4096 # 您設定的篩選路徑數量上限
+        pruning_threshold_count = 256 # 您設定的篩選路徑數量上限
         num_paths_this_hop_before_pruning = num_paths_this_hop # ## NOW THIS IS VALID ##
 
         if num_paths_this_hop > pruning_threshold_count: # Check against initial num_paths_this_hop
@@ -1414,7 +1382,7 @@ class GraphModel(nn.Module):
                 (path_specific_tgt_embs_for_encoding, path_edge_embs_for_gin_and_path_enc), dim=-1
             )
         elif cand_tgt_idx_hop.numel() > 0 : # 如果剪枝後仍有路徑，但嵌入準備有問題
-            print(f"警告: PathEncoder 的目標嵌入或邊嵌入準備不一致或為空。 Tgt shape: {path_specific_tgt_embs_for_encoding.shape}, Edge shape: {path_edge_em_bs_for_gin_and_path_enc.shape}")
+            print(f"警告: PathEncoder 的目標嵌入或邊嵌入準備不一致或為空。 Tgt shape: {path_specific_tgt_embs_for_encoding.shape}, Edge shape: {path_edge_embs_for_gin_and_path_enc.shape}")
             # 創建一個正確形狀的空張量或零張量，以避免後續 mini-batch 迴圈出錯
             # actual_edge_dim 需要從 self.e_encoder.num_edge_types 獲取
             _actual_edge_dim = self.e_encoder.num_edge_types if self.e_encoder.num_edge_types > 0 else 0
@@ -1541,15 +1509,12 @@ class GraphModel(nn.Module):
 
             # --- 後續的編碼與排序邏輯 ---
             # 準備 combined_tgt_edge_b (這部分需要小心，確保索引 s_ 的應用正確)
-            map_global_tgt_idx_to_local_in_unique = {glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices)}
+            # map_global_tgt_idx_to_local_in_unique = {glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_tgt_indices)}
             
             # cand_tgt_idx_hop[s_] 獲取當前 mini-batch 對應的目標節點的全局索引
             current_batch_tgt_global_indices = cand_tgt_idx_hop[s_]
             # 將這些全局索引轉換為在 unique_tgt_embs 中的局部索引
-            current_batch_tgt_local_indices = torch.tensor(
-                [map_global_tgt_idx_to_local_in_unique[idx.item()] for idx in current_batch_tgt_global_indices],
-                dtype=torch.long, device=self.device
-            )
+            current_batch_tgt_local_indices = map_global_tgt_to_local_tensor[current_batch_tgt_global_indices]
             path_specific_tgt_embs_for_batch = unique_tgt_embs[current_batch_tgt_local_indices]
             
             combined_tgt_edge_b = torch.cat(
@@ -1631,179 +1596,286 @@ class GraphModel(nn.Module):
         visited_paths_str_dict = {}
         return all_paths_info, visited_paths_str_dict, next_hop_state, stop_flag
     
-    
-class TestGraphModel(unittest.TestCase):
-
-    @classmethod
-    def setUpClass(cls):
-        """在所有測試開始前，準備一次共享資源"""
-        print("\n--- 準備測試環境: 創建 Mock 圖譜和嵌入 ---")
-        cls.hdim = 768
-        cls.device = torch.device('cuda') # 在 CPU 上測試以簡化
-
-        # 1. 創建一個簡單的 NetworkX 圖
-        cls.g_nx = nx.DiGraph()
-        cls.g_nx.add_edge("C01", "C02", label="R1")
-        cls.g_nx.add_edge("C01", "C03", label="R2")
-        cls.g_nx.add_edge("C02", "C04", label="R3") # 這構成了一條 2-hop 路徑: C01 -> C02 -> C04
-        cls.nodes = sorted(list(cls.g_nx.nodes())) # ['C01', 'C02', 'C03', 'C04']
-
-        # 2. 創建一個 Mock CuiEmbedding 對象
-        mock_embedding_data = {cui: torch.randn(1, cls.hdim) for cui in cls.nodes}
-        cls.mock_cui_lookup = MagicMock()
-        cls.mock_cui_lookup.encode.side_effect = lambda cuis: torch.cat([mock_embedding_data[c] for c in cuis]).to(cls.device)
+class TestGraphModelOneIteration(unittest.TestCase):
+    def setUp(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.hdim = 9 # Small hidden dimension for tests
         
-        # 3. 準備其他輸入
-        cls.mock_cui_weights = {cui: 1.0 for cui in cls.nodes}
-        cls.task_emb = torch.randn(1, cls.hdim, device=cls.device)
-        cls.context_emb = torch.randn(1, cls.hdim, device=cls.device)
+        # 1. Mock NetworkX Graph
+        self.g_nx = nx.DiGraph()
+        self.g_nx.add_edge("C001", "C002", label="RelA")
+        self.g_nx.add_edge("C001", "C003", label="RelB")
+        self.g_nx.add_edge("C002", "C004", label="RelC")
+        self.g_nx.add_edge("C003", "C004", label="RelD")
+        self.g_nx.add_node("C005") # Isolated node
 
-    def test_01_graphmodel_initialization(self):
-        """測試 GraphModel 是否能根據配置正確初始化"""
-        print("\n--- 測試 1: GraphModel 初始化 ---")
+        # 2. Mock CuiEmbedding object
+        self.mock_cui_embeddings_dict = {
+            "C001": np.random.rand(1, self.hdim).tolist(),
+            "C002": np.random.rand(1, self.hdim).tolist(),
+            "C003": np.random.rand(1, self.hdim).tolist(),
+            "C004": np.random.rand(1, self.hdim).tolist(),
+            "C005": np.random.rand(1, self.hdim).tolist(),
+        }
+        self.cui_embedding_lookup = CuiEmbedding(self.mock_cui_embeddings_dict, self.hdim, self.device)
+
+        # 3. Mock cui_weights_dict
+        self.cui_weights = {"C001": 1.5, "C002": 0.8}
+
+        # Task and Context Embeddings (Batch size of 1 for simplicity in testing one_iteration)
+        self.task_emb = torch.randn(1, self.hdim, device=self.device)
+        self.context_emb = torch.randn(1, self.hdim, device=self.device)
+        
+        # Global cui_to_idx and edge_to_idx will be set by preprocess_graph_to_tensors
+        # This happens inside GraphModel.__init__
+
+    def _init_graph_model(self, gnn_update=False, path_encoder_type="MLP", gnn_type="Stack", top_n=3, num_hops=2):
         model = GraphModel(
             g_nx=self.g_nx,
-            cui_embedding_lookup=self.mock_cui_lookup,
+            cui_embedding_lookup=self.cui_embedding_lookup,
             hdim=self.hdim,
-            nums_of_head=4, num_hops=2, top_n=8, device=self.device,
-            gnn_update=True, gnn_type="Stack" # 測試 GINStack
-        )
-        self.assertIsNotNone(model.g_tensorized, "圖譜張量化不應為 None")
-        self.assertEqual(model.g_tensorized['num_nodes'], len(self.nodes), "張量化後的節點數量不對")
-        self.assertIsInstance(model.gnn, GINStack, "GNN 類型應為 GINStack")
-        print("PASS: GraphModel 初始化成功。")
-
-    def test_02_one_iteration_first_hop(self):
-        """測試第一跳推理的完整流程"""
-        print("\n--- 測試 2: one_iteration 第一跳推理 ---")
-        model = GraphModel(
-            g_nx=self.g_nx, cui_embedding_lookup=self.mock_cui_lookup, hdim=self.hdim,
-            nums_of_head=4, num_hops=2, top_n=8, device=self.device
-        )
-        model.to(self.device) # 確保模型在正確的設備上
-
-        all_paths_info, _, next_hop_state, stop_flag = model.one_iteration(
-            task_emb_batch=self.task_emb,
-            current_cui_str_list=['C01'], # 從 C01 開始
-            running_k_hop=0,
-            context_emb_batch=self.context_emb,
-            prev_iteration_state=None
-        )
-
-        self.assertFalse(stop_flag, "第一跳不應停止")
-        self.assertIsNotNone(all_paths_info, "路徑資訊不應為 None")
-        
-        # 預期從 C01 出發有兩條路徑：到 C02 和 C03
-        num_paths_found = all_paths_info['scores'].shape[0]
-        self.assertEqual(num_paths_found, 2, "第一跳應找到2條路徑")
-
-        # 檢查返回的張量形狀
-        self.assertEqual(all_paths_info['encoded_embeddings'].shape, (2, self.hdim))
-        self.assertEqual(all_paths_info['scores'].shape, (2, 1))
-
-        # 檢查 Top-N 選擇後的結果
-        # 因為 top_n=8 > 2，所以兩條路徑都應被選中
-        selected_targets_idx = next_hop_state['selected_hop_target_idx']
-        self.assertEqual(selected_targets_idx.shape[0], 2)
-        
-        # 將索引轉回 CUI 字串進行驗證
-        idx_to_cui = model.g_tensorized['idx_to_cui']
-        selected_targets_cui = {idx_to_cui[idx.item()] for idx in selected_targets_idx}
-        self.assertSetEqual(selected_targets_cui, {'C02', 'C03'}, "被選中的目標節點應為 C02 和 C03")
-        print("PASS: 第一跳推理流程正確。")
-
-    def test_03_one_iteration_second_hop(self):
-        """測試第二跳推理，特別是路徑歷史的傳遞"""
-        print("\n--- 測試 3: one_iteration 第二跳推理 ---")
-        model = GraphModel(
-            g_nx=self.g_nx, cui_embedding_lookup=self.mock_cui_lookup, hdim=self.hdim,
-            nums_of_head=4, num_hops=2, top_n=8, device=self.device
+            nums_of_head=2, # Example
+            num_hops=num_hops,
+            top_n=top_n,
+            device=self.device,
+            cui_weights_dict=self.cui_weights,
+            gnn_update=gnn_update,
+            path_encoder_type=path_encoder_type,
+            gnn_type=gnn_type,
+            gin_num_layers=1 # Simplified for testing GINStack
         )
         model.to(self.device)
+        return model
 
-        # 手動模擬第一跳的輸出，作為第二跳的輸入
-        cui_to_idx = model.g_tensorized['cui_to_idx']
-        first_hop_output = {
-            "selected_src_orig_idx": torch.tensor([cui_to_idx['C01'], cui_to_idx['C01']], device=self.device),
-            "selected_hop_target_idx": torch.tensor([cui_to_idx['C02'], cui_to_idx['C03']], device=self.device)
-        }
+    def test_one_iteration_1hop_no_paths(self):
+        """Test case where starting CUI has no outgoing paths."""
+        graph_model = self._init_graph_model()
+        start_cuis = ["C005"] # Isolated node
         
-        all_paths_info, _, _, stop_flag = model.one_iteration(
-            task_emb_batch=self.task_emb,
-            current_cui_str_list=['C02', 'C03'], # 從 C02 和 C03 開始第二跳
-            running_k_hop=1,
-            context_emb_batch=self.context_emb,
-            prev_iteration_state=first_hop_output
+        all_paths_info, _, next_state, stop_flag = graph_model.one_iteration(
+            self.task_emb, start_cuis, running_k_hop=0, context_emb_batch=self.context_emb
         )
+        self.assertIsNone(all_paths_info) # Expecting None when no paths
+        self.assertTrue(stop_flag)
 
+    def test_one_iteration_1hop_basic_mlp(self):
+        """Test 1-hop inference with MLP PathEncoder."""
+        top_n_test = 2
+        graph_model = self._init_graph_model(gnn_update=False, path_encoder_type="MLP", top_n=top_n_test)
+        start_cuis = ["C001"]
+        
+        all_paths_info, _, next_state, stop_flag = graph_model.one_iteration(
+            self.task_emb, start_cuis, running_k_hop=0, context_emb_batch=self.context_emb
+        )
         self.assertFalse(stop_flag)
+        self.assertIsNotNone(all_paths_info)
         
-        # 預期：只有 C02 有出邊到 C04，所以只會找到一條路徑
-        num_paths_found = all_paths_info['scores'].shape[0]
-        self.assertEqual(num_paths_found, 1, "第二跳應只找到1條路徑 (C02->C04)")
-        
-        # **關鍵驗證**: 檢查路徑記憶是否正確
-        # `mem_orig_src_idx` 應該是這條路徑的最初始源頭，即 C01
-        mem_idx = all_paths_info['mem_orig_src_idx'][0].item()
-        self.assertEqual(mem_idx, cui_to_idx['C01'], "路徑記憶應追蹤到最初始的源頭 C01")
-        
-        # 檢查這條路徑的源和目標
-        src_idx = all_paths_info['src_idx'][0].item()
-        tgt_idx = all_paths_info['tgt_idx'][0].item()
-        self.assertEqual(src_idx, cui_to_idx['C02'], "第二跳路徑的源應為 C02")
-        self.assertEqual(tgt_idx, cui_to_idx['C04'], "第二跳路徑的目標應為 C04")
-        print("PASS: 第二跳推理及路徑歷史追蹤正確。")
+        # C001 has 2 outgoing paths: C001->RelA->C002, C001->RelB->C003
+        self.assertEqual(all_paths_info["scores"].shape[0], 2) # Number of paths from C001
+        self.assertEqual(all_paths_info["encoded_embeddings"].shape, (2, self.hdim))
+        self.assertEqual(all_paths_info["tgt_idx"].numel(), 2)
 
-    @patch('__main__.PathEncoderTransformer.forward') # 根據您實際的文件結構修改 '__main__'
-    def test_04_transformer_encoder_input_shape(self, mock_transformer_forward):
-        """測試當使用 Transformer 編碼器時，輸入序列的形狀是否正確"""
-        print("\n--- 測試 4: PathEncoderTransformer 輸入序列驗證 ---")
+        self.assertIsNotNone(next_state)
+        self.assertEqual(next_state["selected_hop_target_idx"].numel(), top_n_test) # top_n paths selected
+        self.assertIsNotNone(next_state["selected_src_orig_idx"])
+        self.assertEqual(next_state["selected_src_orig_idx"].numel(), top_n_test)
+        # For 1st hop, selected_first_hop_edge_idx should be the edges of the current hop
+        self.assertIsNotNone(next_state["selected_first_hop_edge_idx"])
+        self.assertEqual(next_state["selected_first_hop_edge_idx"].numel(), top_n_test)
         
-        # 設置返回一個符合尺寸的假輸出以繼續流程
-        mock_transformer_forward.return_value = torch.randn(1, self.hdim, device=self.device)
+        # Check if original source is C001 for selected paths
+        c001_idx = graph_model.g_tensorized['cui_to_idx']["C001"]
+        self.assertTrue(torch.all(next_state["selected_src_orig_idx"] == c001_idx))
 
-        model = GraphModel(
-            g_nx=self.g_nx, cui_embedding_lookup=self.mock_cui_lookup, hdim=self.hdim,
-            nums_of_head=4, num_hops=2, top_n=8, device=self.device,
-            path_encoder_type="Transformer" # **啟用 Transformer**
+
+    def test_one_iteration_1hop_cui_weights_applied(self):
+        graph_model = self._init_graph_model(gnn_update=False, path_encoder_type="MLP")
+        start_cuis = ["C001"] # C001 has weight 1.5
+        
+        # To check weight application, we'd ideally need to inspect 
+        # `current_path_src_embs_for_encoding` inside `one_iteration`
+        # or mock `_get_embeddings_by_indices` and `p_encoder` to verify inputs.
+        # This is more of an integration check.
+        # We can check if the scores are produced.
+        with patch.object(graph_model, '_get_embeddings_by_indices', wraps=graph_model._get_embeddings_by_indices) as mock_get_emb:
+            all_paths_info, _, _, _ = graph_model.one_iteration(
+                self.task_emb, start_cuis, running_k_hop=0, context_emb_batch=self.context_emb
+            )
+            self.assertIsNotNone(all_paths_info)
+            # Difficult to assert the exact numerical effect of weighting without deeper mocking
+            # or specific values that would make the effect obvious.
+            # For now, confirm it runs. In a more detailed test, one could mock `_get_embeddings_by_indices`
+            # to return known values and then check if `current_path_src_embs_for_encoding` reflects the weight.
+
+
+    def test_one_iteration_2hop_mlp_memory_passing(self):
+        """Test 2-hop, focusing on how memory (orig_src, first_edge) is passed."""
+        top_n_test = 1 # Select one path from 1st hop to make 2nd hop predictable
+        graph_model = self._init_graph_model(gnn_update=False, path_encoder_type="MLP", top_n=top_n_test)
+        
+        # --- Mock 1st Hop ---
+        start_cuis_hop1 = ["C001"]
+        # Manually create a plausible prev_iteration_state for 2nd hop
+        # Say, 1st hop selected C001 -> RelA -> C002
+        c001_idx = graph_model.g_tensorized['cui_to_idx']["C001"]
+        c002_idx = graph_model.g_tensorized['cui_to_idx']["C002"]
+        rela_idx = graph_model.g_tensorized['edge_to_idx']["RelA"]
+
+        prev_state_for_hop2 = {
+            "selected_src_orig_idx": torch.tensor([c001_idx], device=self.device),
+            "selected_hop_target_idx": torch.tensor([c002_idx], device=self.device), # This becomes start CUI for hop 2
+            "selected_first_hop_edge_idx": torch.tensor([rela_idx], device=self.device)
+        }
+        start_cuis_hop2 = ["C002"] # Target from hop1
+
+        # --- Execute 2nd Hop ---
+        all_paths_info_hop2, _, next_state_hop2, stop_flag_hop2 = graph_model.one_iteration(
+            self.task_emb, start_cuis_hop2, running_k_hop=1, 
+            context_emb_batch=self.context_emb, prev_iteration_state=prev_state_for_hop2
         )
-        model.p_encoder.forward = mock_transformer_forward # 替換為 mock
-        model.to(self.device)
+        self.assertFalse(stop_flag_hop2)
+        self.assertIsNotNone(all_paths_info_hop2)
+        # C002 has 1 outgoing path: C002 -> RelC -> C004
+        self.assertEqual(all_paths_info_hop2["scores"].shape[0], 1) 
+        
+        self.assertIsNotNone(next_state_hop2)
+        self.assertEqual(next_state_hop2["selected_hop_target_idx"].numel(), top_n_test) # Should be C004
+        c004_idx = graph_model.g_tensorized['cui_to_idx']["C004"]
+        self.assertEqual(next_state_hop2["selected_hop_target_idx"][0].item(), c004_idx)
 
-        # 模擬第二跳
-        cui_to_idx = model.g_tensorized['cui_to_idx']
-        first_hop_output = {
-            "selected_src_orig_idx": torch.tensor([cui_to_idx['C01']], device=self.device),
-            "selected_hop_target_idx": torch.tensor([cui_to_idx['C02']], device=self.device)
+        # Crucial checks for memory:
+        # Original source should still be C001
+        self.assertEqual(next_state_hop2["selected_src_orig_idx"][0].item(), c001_idx)
+        # First hop edge should still be RelA
+        self.assertEqual(next_state_hop2["selected_first_hop_edge_idx"][0].item(), rela_idx)
+
+    def test_one_iteration_path_pruning(self):
+        graph_model_for_prune = self._init_graph_model(top_n=2)
+        start_cuis = ["C001"] 
+
+        # 修改這裡：wraps 實例上的方法
+        with patch.object(graph_model_for_prune, 'one_iteration', wraps=graph_model_for_prune.one_iteration) as wrapped_one_iter_on_instance:
+            all_paths_info, _, _, _ = graph_model_for_prune.one_iteration(
+                task_emb_batch=self.task_emb, 
+                current_cui_str_list=start_cuis, 
+                running_k_hop=0,
+                context_emb_batch=self.context_emb, # 確保所有需要的參數都被傳遞
+                prev_iteration_state=None
+            )
+            
+            wrapped_one_iter_on_instance.assert_called_once_with(
+                task_emb_batch=self.task_emb,
+                current_cui_str_list=start_cuis,
+                running_k_hop=0,
+                context_emb_batch=self.context_emb,
+                prev_iteration_state=None
+            )
+            
+            if all_paths_info is not None and "scores" in all_paths_info:
+                 self.assertEqual(all_paths_info["scores"].shape[0], 2) 
+            else:
+                 self.fail("one_iteration did not return expected path_info dictionary or was None")
+
+    def test_one_iteration_gnn_update_flow(self):
+        graph_model_gnn = self._init_graph_model(gnn_update=True, gnn_type="Stack", top_n=1)
+        start_cuis = ["C001"]
+
+        # Mock the GNN module itself to verify it's called and its output is used.
+        mock_gnn_output_emb = torch.randn(1, self.hdim, device=self.device) # GNN updates unique_src_embs
+        
+        # Since GNN is part of graph_model, we patch its forward method
+        with patch.object(graph_model_gnn.gnn, 'forward', return_value=(mock_gnn_output_emb, torch.tensor([graph_model_gnn.g_tensorized['cui_to_idx']['C001']], device=self.device))) as mock_gnn_forward:
+            with patch.object(graph_model_gnn.p_encoder, 'forward') as mock_penc_forward:
+                # Mock path encoder to see what src embeddings it receives
+                mock_penc_forward.return_value = torch.randn(graph_model_gnn.g_tensorized['adj_src'].numel(), self.hdim, device=self.device)[:2,:] # Mock output for 2 paths from C001
+
+                graph_model_gnn.one_iteration(
+                    self.task_emb, start_cuis, running_k_hop=0
+                )
+                mock_gnn_forward.assert_called_once()
+                
+                # Check if p_encoder received GNN's output (indirectly)
+                # The first argument to p_encoder.forward is src_b (path_specific_src_embs)
+                # which should be derived from current_path_src_embs_for_encoding, which GNN updated.
+                # This is tricky to assert directly without more complex mocking of intermediate states.
+                # For now, asserting GNN was called is a good first step.
+                # And that p_encoder was subsequently called.
+                mock_penc_forward.assert_called()
+
+
+    def test_one_iteration_transformer_path_encoder_1hop(self):
+        graph_model_transformer = self._init_graph_model(path_encoder_type="Transformer", top_n=1)
+        start_cuis = ["C001"] # C001 -> C002 (RelA), C001 -> C003 (RelB)
+
+        with patch.object(graph_model_transformer.p_encoder, 'forward') as mock_transformer_forward:
+            # Mock return value to be [batch_path_encoder, hdim]
+            # If 2 paths are processed in the batch for path_encoder
+            mock_transformer_forward.return_value = torch.randn(2, self.hdim, device=self.device) 
+
+            graph_model_transformer.one_iteration(self.task_emb, start_cuis, running_k_hop=0)
+            
+            mock_transformer_forward.assert_called()
+            # Args to PathEncoderTransformer: forward(self, src_seq, tgt_edge_combined_single_step)
+            # For 1-hop, src_seq should ideally be based on just the source node embedding
+            # e.g., shape [num_paths_in_batch, 1, hdim] if seq_len is 1
+            call_args = mock_transformer_forward.call_args[0]
+            src_seq_arg = call_args[0] # src_b_for_pencoder
+            
+            # print(f"Transformer 1-hop src_seq_arg shape: {src_seq_arg.shape}")
+            # Expected sequence for 1-hop: [Orig_Src_Emb]
+            # So, seq_len should be 1 if correctly implemented.
+            self.assertEqual(src_seq_arg.ndim, 3) # [batch_size_for_penc, seq_len, hdim]
+            # Based on your Transformer PEncoder input logic:
+            # For hop 0: path_elements_embs_list will contain [current_src_emb]
+            # So seq_len after pad_sequence will be 1.
+            if src_seq_arg.numel() > 0: # If any paths were processed
+                 self.assertEqual(src_seq_arg.shape[1], 1, "Transformer src_seq for 1-hop should have seq_len 1")
+
+    @patch('__main__.retrieve_neighbors_paths_no_self_tensorized') # Patch at the point of import for the test file
+    def test_one_iteration_transformer_path_encoder_2hop(self, mock_retrieve_paths):
+        graph_model_transformer = self._init_graph_model(path_encoder_type="Transformer", top_n=1)
+        
+        # Mocking the output of retrieve_neighbors_paths_no_self_tensorized for a 2-hop scenario
+        # Say current CUI is C002, original was C001 via RelA
+        c001_idx = graph_model_transformer.g_tensorized['cui_to_idx']["C001"]
+        c002_idx = graph_model_transformer.g_tensorized['cui_to_idx']["C002"]
+        c004_idx = graph_model_transformer.g_tensorized['cui_to_idx']["C004"]
+        rela_idx = graph_model_transformer.g_tensorized['edge_to_idx']["RelA"]
+        relc_idx = graph_model_transformer.g_tensorized['edge_to_idx']["RelC"]
+
+        mock_retrieve_paths.return_value = (
+            torch.tensor([c002_idx], device=self.device),                 # cand_src_idx_hop (current src: C002)
+            torch.tensor([c004_idx], device=self.device),                 # cand_tgt_idx_hop (target: C004)
+            torch.tensor([relc_idx], device=self.device),                 # cand_edge_idx_hop (edge: RelC)
+            torch.tensor([c001_idx], device=self.device),                 # mem_orig_src_idx_hop (original src: C001)
+            torch.tensor([rela_idx], device=self.device)                  # mem_first_edge_idx_hop (first edge: RelA)
+        )
+        
+        start_cuis_hop2 = ["C002"]
+        # This prev_state isn't directly used by the patched retrieve_paths, but good for context
+        prev_state_for_hop2 = { 
+            "selected_src_orig_idx": torch.tensor([c001_idx], device=self.device),
+            "selected_hop_target_idx": torch.tensor([c002_idx], device=self.device),
+            "selected_first_hop_edge_idx": torch.tensor([rela_idx], device=self.device)
         }
 
-        model.one_iteration(
-            task_emb_batch=self.task_emb,
-            current_cui_str_list=['C02'], # 只從 C02 擴展
-            running_k_hop=1,
-            context_emb_batch=self.context_emb,
-            prev_iteration_state=first_hop_output
-        )
+        with patch.object(graph_model_transformer.p_encoder, 'forward') as mock_transformer_forward:
+            mock_transformer_forward.return_value = torch.randn(1, self.hdim, device=self.device) # 1 path in this mock
 
-        # 驗證 mock_transformer_forward 被調用
-        self.assertTrue(mock_transformer_forward.called, "PathEncoderTransformer 的 forward 未被調用")
-        
-        # 獲取傳遞給 forward 的參數
-        call_args, _ = mock_transformer_forward.call_args
-        src_input_to_transformer = call_args[0] # forward 的第一個參數是 src
-
-        # **關鍵驗證**: 檢查輸入序列的形狀
-        # 因為是第二跳，歷史有2個節點（初始+中間），所以 seq_len 應為 2
-        # 小批次大小為 1 (因為只找到一條 C02->C04 的路徑)
-        expected_shape = (1, 2, self.hdim) # (batch_size, seq_len, hdim)
-        self.assertEqual(src_input_to_transformer.shape, expected_shape, 
-                         f"Transformer 的源輸入序列形狀應為 {expected_shape}，但得到 {src_input_to_transformer.shape}")
-        print("PASS: PathEncoderTransformer 的輸入序列形狀正確。")
-
+            graph_model_transformer.one_iteration(
+                self.task_emb, start_cuis_hop2, running_k_hop=1, prev_iteration_state=prev_state_for_hop2
+            )
+            
+            mock_transformer_forward.assert_called_once()
+            call_args = mock_transformer_forward.call_args[0]
+            src_seq_arg = call_args[0] # src_b_for_pencoder
+            
+            # Expected sequence for 2-hop: [Orig_Src_Emb, First_Rel_Emb, Intermediate_Node_Emb (current_src)]
+            # So, seq_len should be 3 if correctly implemented.
+            # print(f"Transformer 2-hop src_seq_arg shape: {src_seq_arg.shape}")
+            if src_seq_arg.numel() > 0:
+                 self.assertEqual(src_seq_arg.ndim, 3)
+                 self.assertEqual(src_seq_arg.shape[1], 3, "Transformer src_seq for 2-hop should have seq_len 3")
 
 if __name__ == '__main__':
-    # 為了在 notebook 或非標準環境下運行
-    suite = unittest.TestSuite()
-    suite.addTest(unittest.makeSuite(TestGraphModel))
-    runner = unittest.TextTestRunner()
-    runner.run(suite)
+    unittest.main(argv=['first-arg-is-ignored'], exit=False)

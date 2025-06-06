@@ -361,43 +361,6 @@ def collate_fn_mediq_preprocessed(batch):
 
 # ====================== gnn_utils ===================
 # Graph utils functions 
-def retrieve_cuis(text,g, matcher):
-    # Retrieve cuis from quickUMLS 
-    output = matcher.match(text)
-    #output
-    cui_output= [ii['cui'] for i in output for ii in i if ii['cui'] in g.nodes]
-    terms = [ii['term'] for i in output for ii in i if ii['cui'] in g.nodes]
-    cui_outputs = set(cui_output)
-
-    # answer: C0010346 
-    return cui_outputs, output
-
-def retrieve_subgraphs(cuis, g):
-    # Get subgraphs into a dictionary 
-    paths = {}
-    for c in cuis:
-        paths[c] = [] 
-        nodes = list(g.neighbors(c))
-        for n in nodes:
-            edge_label = g.get_edge_data(c, n)['label']
-            paths[c].append([n, edge_label])
-    return paths 
-
-
-def retrieve_phrases(paths, cui_aui_mappings):
-    # Map CUI back to phrases to get representation  
-    phrase_paths = {}
-    for s, t in paths.items():
-        sp = cui_aui_mappings[s][0][1] 
-        phrase_paths[sp] = []
-        for tn in t:
-            vp = cui_aui_mappings[tn[0]][0][1]
-            phrase_paths[sp].append([vp, tn[1]])
-    return phrase_paths
-
-
-
-
 
 def preprocess_graph_to_tensors(graph_nx):
     global mock_cui_to_idx, mock_edge_to_idx
@@ -566,65 +529,6 @@ def retrieve_neighbors_paths_no_self_tensorized(
            path_memory_src_prev_hop_tensor.to(device) if path_memory_src_prev_hop_tensor is not None else None, \
            path_memory_first_edge_idx_tensor.to(device) if path_memory_first_edge_idx_tensor is not None else None # ## ADDED
 
-
-
-
-# Graph retriever utils 
-def project_cui_to_vocab(all_paths_df, cui_vocab):
-    vocab_idx = []
-    new_srcs = all_paths_df['Tgt']
-    for _ in new_srcs:
-        vocab_idx.append(cui_vocab[_])
-    return vocab_idx 
-
-
-def sort_visited_paths(indices, all_paths_df, visited_path_embs, prev_visited_paths):
-    # Postprocess for top-n selected CUIs
-    visited_paths = {}
-    new_src_cuis_emb = {}
-    if len(prev_visited_paths) == 0:
-        for _ in indices:
-            k = _[0].item() 
-            new_src = all_paths_df.iloc[k]['Tgt'] 
-            p = all_paths_df.iloc[k]['Src'] + " --> " + all_paths_df.iloc[k]['Edge'] + " --> " + new_src
-            visited_paths[new_src] = p # for explainability
-            new_src_cuis_emb[new_src] = visited_path_embs[_[0],:] # src CUI embedding to compute next iteration paths
-    else:
-        for _ in indices:
-            k = _[0].item() # index of the top-n path 
-            new_src = all_paths_df.iloc[k]['Tgt'] 
-            if all_paths_df.iloc[k]['Src'] in prev_visited_paths:
-                prev_p = prev_visited_paths[all_paths_df.iloc[k]['Src']]
-                p = prev_p +" --> " + all_paths_df.iloc[k]['Edge'] + " --> " + new_src 
-            else:
-                p = all_paths_df.iloc[k]['Src'] + " --> " + all_paths_df.iloc[k]['Edge'] + " --> " + new_src
-            visited_paths[new_src] = p # for explainability
-            new_src_cuis_emb[new_src] = visited_path_embs[_[0],:] 
-
-    return visited_paths, new_src_cuis_emb 
-
-def prune_paths(input_text_vec, cand_neighbors_vs, cand_neighbors_list, threshold=0.8):
-    """Purpose: filter out the target CUIs that are not 
-    """
-    orig_index = len(cand_neighbors_list) 
-    tgt_embs = cand_neighbors_vs.detach().numpy()
-    xq = input_text_vec.clone().cpu().detach().numpy() # clone the task embedding 
-    new_cand_neighbors_lists = [] 
-    d = tgt_embs.shape[-1]
-    nb = tgt_embs.shape[0]
-    nq = 1
-    k =int(nb*threshold) # sample top K nodes with similarity 
-    #index = faiss.IndexFlatL2(d)   # build the index for euclidean distance 
-    index=faiss.IndexFlatIP(d)     # build the index for cosine distance 
-    index.add(tgt_embs)                  # add vectors to the index
-    D, I = index.search(xq, k)     # actual search, return distance and index 
-    new_cand_neighbor_vs = []
-    I_sorted = np.sort(I, axis=1)
-    new_cand_neighbor_vs = tgt_embs[I_sorted[0]]
-    #print(new_cand_neighbor_vs.shape)
-    new_cand_neighbors_lists = [cand_neighbors_list[_] for _ in I_sorted[0]]
-
-    return new_cand_neighbors_lists, new_cand_neighbor_vs
 # ====================== gnn  ===================
 
 class CuiEmbedding(object):
@@ -1191,7 +1095,7 @@ class GraphModel(nn.Module):
             self.p_ranker = TriAttnFlatPathRanker(hdim)
 
         self.k_hops = num_hops
-        self.path_per_batch_size = 4096
+        self.path_per_batch_size = 256
         self.top_n = top_n
         self.cui_weights_dict = cui_weights_dict if cui_weights_dict else {}
         self.hdim = hdim # Store hdim for use
@@ -1375,7 +1279,7 @@ class GraphModel(nn.Module):
             current_path_src_embs_for_encoding = updated_src_embs_from_gin
             # print(f"GIN updated src embs shape: {current_path_src_embs_for_encoding.shape}")
             
-        pruning_threshold_count = 4096 # 您設定的篩選路徑數量上限
+        pruning_threshold_count = 256 # 您設定的篩選路徑數量上限
         num_paths_this_hop_before_pruning = num_paths_this_hop # ## NOW THIS IS VALID ##
 
         if num_paths_this_hop > pruning_threshold_count: # Check against initial num_paths_this_hop
@@ -1489,7 +1393,7 @@ class GraphModel(nn.Module):
                 (path_specific_tgt_embs_for_encoding, path_edge_embs_for_gin_and_path_enc), dim=-1
             )
         elif cand_tgt_idx_hop.numel() > 0 : # 如果剪枝後仍有路徑，但嵌入準備有問題
-            print(f"警告: PathEncoder 的目標嵌入或邊嵌入準備不一致或為空。 Tgt shape: {path_specific_tgt_embs_for_encoding.shape}, Edge shape: {path_edge_em_bs_for_gin_and_path_enc.shape}")
+            print(f"警告: PathEncoder 的目標嵌入或邊嵌入準備不一致或為空。 Tgt shape: {path_specific_tgt_embs_for_encoding.shape}, Edge shape: {path_edge_embs_for_gin_and_path_enc.shape}")
             # 創建一個正確形狀的空張量或零張量，以避免後續 mini-batch 迴圈出錯
             # actual_edge_dim 需要從 self.e_encoder.num_edge_types 獲取
             _actual_edge_dim = self.e_encoder.num_edge_types if self.e_encoder.num_edge_types > 0 else 0
@@ -1721,7 +1625,7 @@ class Trainer(nn.Module):
                  save_model_path=None,
                  gnn_update=True,
                  intermediate=False, 
-                 score_threshold=0.5, # ## ADDED: 評分閾值
+                 score_threshold=0.9, # ## ADDED: 評分閾值
                  distance_metric="Cosine",
                  path_encoder_type="MLP",
                  path_ranker_type="Flat",
@@ -2028,23 +1932,7 @@ class Trainer(nn.Module):
             current_cui_str_list_for_hop = known_cuis_str_sample
             prev_iter_state_for_next_hop = None
             
-            # ## ADDED: 儲存當前樣本每一跳超過閾值的路徑信息
-            # 格式: { path_tuple_key: {"target_idx": CUI_idx, "score": float, "hop": int, "path_indices": tuple} }
-            # path_tuple_key 可以是 (orig_src_idx, first_edge_idx, intermediate_idx, second_edge_idx, final_target_idx)
-            # 或簡化為 (orig_src_idx, intermediate_idx_or_final_target_idx) for 1-hop
-            # (orig_src_idx, intermediate_idx, final_target_idx) for 2-hop
-            # 為了路徑取代，我們需要能唯一識別路徑並追蹤其組成
-            # 結構: high_confidence_paths_sample[hop_num] = list of dicts
-            # dict = {"orig_src_idx": tensor, "first_edge_idx": tensor (or -1), "inter_or_final_tgt_idx": tensor, "final_tgt_idx": tensor (for 2hop), "score": tensor, "hop_num": int}
-            
-            # 簡化：只儲存用於下一跳探索的 top_n 節點的詳細信息
-            # 和一個用於最終預測的、基於閾值的候選列表
-            
-            # 儲存每一跳超過閾值的 (最初始源頭CUI, 最終目標CUI, 跳數, 完整路徑元組(索引), 分數)
-            # full_path_indices: (orig_s_idx, r1_idx, inter_s_idx, r2_idx, final_t_idx)
-            # 對於1-hop: (orig_s_idx, r1_idx, final_t_idx, -1, -1)
-            # 這裡的 key 可以是最終目標CUI，value是包含路徑和分數的字典，以處理多個路徑指向同一目標
-            # 但為了路徑取代，我們需要以 "最初始源頭->中間節點" 作為鍵
+    
             
             # 最終預測集合，key: (orig_src_idx, first_hop_target_idx), value: {"path": path_tuple, "score": score, "hop": 1 or 2}
             current_sample_final_preds_dict = {}
@@ -2252,11 +2140,19 @@ class Trainer(nn.Module):
                 if batch is None: continue 
                 
                 batch_avg_loss, final_preds_str, hop1_preds_str = self.forward_per_batch(batch)
-                
-                # ## MODIFIED: 分別計算1-hop和最終(可能是混合了1-hop和2-hop)的準確率
-                p1, r1, f1_1 = self.measure_accuracy(hop1_preds_str, batch['hop1_target_cuis'])
-                p_final, r_final, f1_final = self.measure_accuracy(final_preds_str, batch['hop2_target_cuis']) # 假設最終預測主要對標 hop2 GT
+                              
 
+                hop1_gt_batch = batch['hop1_target_cuis']
+                hop2_gt_batch = batch['hop2_target_cuis']
+               
+                combined_gt_batch = [
+                    list(set(hop1_gt_batch[i] + hop2_gt_batch[i]))
+                    for i in range(len(hop1_gt_batch))
+                ]
+
+                p1, r1, f1_1 = self.measure_accuracy(hop1_preds_str, batch['hop1_target_cuis'])
+                p_final, r_final, f1_final = self.measure_accuracy(final_preds_str, combined_gt_batch)
+                
                 # 記錄用於epoch平均的指標
                 epoch_p1_train.append(p1); epoch_r1_train.append(r1); epoch_f1_1_train.append(f1_1)
                 epoch_p_final_train.append(p_final); epoch_r_final_train.append(r_final); epoch_f1_final_train.append(f1_final)
@@ -2299,9 +2195,11 @@ class Trainer(nn.Module):
             if lr_scheduler: lr_scheduler.step()
 
             # ## MODIFIED: Early Stopping and Model Saving based on a primary metric, e.g., F1@Final
-            current_metric_val = avg_ep_f1_final_dev # 或者 val_loss: avg_ep_dev_loss
-            # ... (提前停止與模型保存邏輯，與之前類似，只是選擇比較的指標可能改變) ...
-            # ... (例如，如果 F1@Final 提升則保存模型) ...
+            if self.early_stopping_metric == 'val_loss':
+                current_metric_val = avg_ep_dev_loss
+            elif self.early_stopping_metric == 'val_acc':
+                current_metric_val = avg_ep_f1_final_dev
+          
             improved = False
             if self.early_stopping_metric == 'val_loss':
                 if current_metric_val < self.best_metric_val - self.early_stopping_delta: improved = True
@@ -2337,13 +2235,30 @@ class Trainer(nn.Module):
         epoch_p_final_dev, epoch_r_final_dev, epoch_f1_final_dev = [], [], []
         
         dev_pbar = tqdm(dev_data_loader, desc="Validation")
+        
+        hop1_num_list, final_num_list , hop1_target_num_list, final_target_num_list = [], [], [], []
+        
+        
         with torch.no_grad():
             for batch in dev_pbar:
                 if batch is None: continue
                 batch_avg_loss, final_preds_str, hop1_preds_str = self.forward_per_batch(batch)
                 
+                hop1_gt_batch = batch['hop1_target_cuis']
+                hop2_gt_batch = batch['hop2_target_cuis']
+                combined_gt_batch = [
+                    list(set(hop1_gt_batch[i] + hop2_gt_batch[i]))
+                    for i in range(len(hop1_gt_batch))
+                ]
+                
+                for i in range(len(hop1_gt_batch)):
+                    hop1_num_list.append(len(hop1_preds_str[i]))
+                    final_num_list.append(len(final_preds_str[i]))
+                    hop1_target_num_list.append(len(hop1_gt_batch[i]))
+                    final_target_num_list.append(len(combined_gt_batch[i]))
+
                 p1, r1, f1_1 = self.measure_accuracy(hop1_preds_str, batch['hop1_target_cuis'])
-                p_final, r_final, f1_final = self.measure_accuracy(final_preds_str, batch['hop2_target_cuis']) # 假設
+                p_final, r_final, f1_final = self.measure_accuracy(final_preds_str, combined_gt_batch)
 
                 epoch_loss_dev_list.append(batch_avg_loss.item())
                 epoch_p1_dev.append(p1); epoch_r1_dev.append(r1); epoch_f1_1_dev.append(f1_1)
@@ -2358,6 +2273,13 @@ class Trainer(nn.Module):
         avg_r_final = np.mean(epoch_r_final_dev) if epoch_r_final_dev else 0.0
         avg_f1_final = np.mean(epoch_f1_final_dev) if epoch_f1_final_dev else 0.0
         
+        hop1_avg_num = np.mean(hop1_num_list) if hop1_num_list else 0.0
+        final_avg_num = np.mean(final_num_list) if final_num_list else 0.0
+        hop1_target_avg_num = np.mean(hop1_target_num_list) if hop1_target_num_list else 0.0
+        final_target_avg_num = np.mean(final_target_num_list) if final_target_num_list else 0.0
+        print(f"hop1_avg_num: {hop1_avg_num}, final_avg_num: {final_avg_num}, hop1_target_avg_num: {hop1_target_avg_num}, final_target_avg_num: {final_target_avg_num}")
+        
+       
         return avg_loss, avg_p1, avg_r1, avg_f1_1, avg_p_final, avg_r_final, avg_f1_final
 
 # ====================== Main Block ======================
@@ -2411,11 +2333,11 @@ if __name__ =='__main__':
     hdim = base_encoder_model.config.hidden_size
     nums_of_head = 3 
     top_n = 8 
-    epochs = 300 
+    epochs = 100 
     LR = 1e-5 
     intermediate_loss_flag = True 
     contrastive_flag = True 
-    batch_size = 64 
+    batch_size = 4 
     
     gin_hidden_dim_val = hdim 
     gin_num_layers_val = 2  
@@ -2448,7 +2370,7 @@ if __name__ =='__main__':
         intermediate=intermediate_loss_flag,
         save_model_path=model_save_path,
         gnn_update=True, 
-        path_encoder_type="Transformer",
+        path_encoder_type="MLP",
         path_ranker_type="Flat",
         gnn_type="Stack", 
         gin_hidden_dim=gin_hidden_dim_val,
@@ -2475,8 +2397,8 @@ if __name__ =='__main__':
         
         
 
-    train_loader_instance = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_mediq_preprocessed, num_workers=12, pin_memory=True)
-    dev_loader_instance = DataLoader(dev_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_preprocessed, num_workers=12, pin_memory=True)
+    train_loader_instance = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_mediq_preprocessed, num_workers=6, pin_memory=True)
+    dev_loader_instance = DataLoader(dev_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_preprocessed, num_workers=6, pin_memory=True)
     print("Dataloaders created.")
 
     print("\n" + "="*30 + "\n STARTING Tensorized Trainer RUN  \n" + "="*30 + "\n")

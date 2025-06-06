@@ -1,6 +1,8 @@
-torch
+torch==2.6.0
 transformers
 pandas
 tqdm
 networkx
 numpy
+-f https://data.pyg.org/whl/torch-2.6.0+cu124.html
+torch_scatter

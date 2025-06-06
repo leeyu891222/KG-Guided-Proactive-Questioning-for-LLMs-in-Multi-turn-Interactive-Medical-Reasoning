@@ -1208,7 +1208,7 @@ class GraphModel(nn.Module):
             self.p_ranker = TriAttnFlatPathRanker(hdim)
 
         self.k_hops = num_hops
-        self.path_per_batch_size = 4096
+        self.path_per_batch_size = 32
         self.top_n = top_n
         self.cui_weights_dict = cui_weights_dict if cui_weights_dict else {}
         self.hdim = hdim # Store hdim for use
@@ -1394,7 +1394,7 @@ class GraphModel(nn.Module):
             current_path_src_embs_for_encoding = updated_src_embs_from_gin
             # print(f"GIN updated src embs shape: {current_path_src_embs_for_encoding.shape}")
             
-        pruning_threshold_count = 4096 # 您設定的篩選路徑數量上限
+        pruning_threshold_count = 32 # 您設定的篩選路徑數量上限
         num_paths_this_hop_before_pruning = num_paths_this_hop # ## NOW THIS IS VALID ##
 
         if num_paths_this_hop > pruning_threshold_count: # Check against initial num_paths_this_hop
@@ -2047,25 +2047,7 @@ class Trainer(nn.Module):
             current_cui_str_list_for_hop = known_cuis_str_sample
             prev_iter_state_for_next_hop = None
             
-            # ## ADDED: 儲存當前樣本每一跳超過閾值的路徑信息
-            # 格式: { path_tuple_key: {"target_idx": CUI_idx, "score": float, "hop": int, "path_indices": tuple} }
-            # path_tuple_key 可以是 (orig_src_idx, first_edge_idx, intermediate_idx, second_edge_idx, final_target_idx)
-            # 或簡化為 (orig_src_idx, intermediate_idx_or_final_target_idx) for 1-hop
-            # (orig_src_idx, intermediate_idx, final_target_idx) for 2-hop
-            # 為了路徑取代，我們需要能唯一識別路徑並追蹤其組成
-            # 結構: high_confidence_paths_sample[hop_num] = list of dicts
-            # dict = {"orig_src_idx": tensor, "first_edge_idx": tensor (or -1), "inter_or_final_tgt_idx": tensor, "final_tgt_idx": tensor (for 2hop), "score": tensor, "hop_num": int}
             
-            # 簡化：只儲存用於下一跳探索的 top_n 節點的詳細信息
-            # 和一個用於最終預測的、基於閾值的候選列表
-            
-            # 儲存每一跳超過閾值的 (最初始源頭CUI, 最終目標CUI, 跳數, 完整路徑元組(索引), 分數)
-            # full_path_indices: (orig_s_idx, r1_idx, inter_s_idx, r2_idx, final_t_idx)
-            # 對於1-hop: (orig_s_idx, r1_idx, final_t_idx, -1, -1)
-            # 這裡的 key 可以是最終目標CUI，value是包含路徑和分數的字典，以處理多個路徑指向同一目標
-            # 但為了路徑取代，我們需要以 "最初始源頭->中間節點" 作為鍵
-            
-            # 最終預測集合，key: (orig_src_idx, first_hop_target_idx), value: {"path": path_tuple, "score": score, "hop": 1 or 2}
             current_sample_final_preds_dict = {}
 
 
@@ -2440,8 +2422,8 @@ def setup_profiling_environment():
         LR=LEARNING_RATE_FOR_TEST,
         intermediate=True, # 根據您的典型設置
         contrastive_learning=True, # 根據您的典型設置
-        score_threshold=0.5, # 示例
-        path_encoder_type="Transformer", # 或 "MLP"，取決於您想分析哪個
+        score_threshold=0.7, # 示例
+        path_encoder_type="MLP", # 或 "MLP"，取決於您想分析哪個
         # ... 提供 Trainer __init__ 所需的其他所有參數 ...
         save_model_path="./dummy_save_path_for_profiling.pth" # 提供一個假的保存路徑
     )
