@@ -70,6 +70,10 @@ class MediQAnnotatedDataset(Dataset):
         num_cases_after_min_facts_filter = 0
 
         for case_id, data in all_annotations.items():
+            
+            if case_id == "1000":
+                break
+            
             atomic_facts = data.get("atomic_facts", [])
             facts_cuis = data.get("facts_cuis", [])
             paths_between_facts = data.get("paths_between_facts", {})
@@ -1172,7 +1176,7 @@ class GraphModel(nn.Module):
             self.p_ranker = TriAttnFlatPathRanker(hdim)
 
         self.k_hops = num_hops
-        self.path_per_batch_size = 256
+        self.path_per_batch_size = 512
         self.top_n = top_n
         self.cui_weights_dict = cui_weights_dict if cui_weights_dict else {}
         self.hdim = hdim # Store hdim for use
@@ -1233,6 +1237,7 @@ class GraphModel(nn.Module):
                      ):
         stop_flag = False
         
+        
         # 1. Retrieve 1-hop paths using tensorized function
         # prev_candidate_tensors in retrieve_... is prev_iteration_state
         cand_src_idx_hop, cand_tgt_idx_hop, cand_edge_idx_hop, \
@@ -1242,9 +1247,10 @@ class GraphModel(nn.Module):
                 self.g_tensorized,
                 prev_iteration_state
             )
-
+        pre_pruning_cand_tgt_idx_hop = cand_tgt_idx_hop.clone() if cand_tgt_idx_hop is not None else torch.empty(0, dtype=torch.long, device=self.device)
+        debug_info = {'pre_pruning_targets': pre_pruning_cand_tgt_idx_hop}
         if cand_src_idx_hop.numel() == 0: # No paths found
-            return None, {}, None, True # Scores, next_hop_dict, path_tensors, mem_tensors, stop_flag
+            return None, {}, None, True, debug_info # Scores, next_hop_dict, path_tensors, mem_tensors, stop_flag
         
         num_paths_this_hop = cand_src_idx_hop.size(0)
 
@@ -1261,8 +1267,8 @@ class GraphModel(nn.Module):
         unique_mem_orig_src_embs = self._get_embeddings_by_indices(unique_mem_orig_src_indices) if unique_mem_orig_src_indices is not None else None
 
         if unique_src_embs_base.numel() == 0 or unique_tgt_embs.numel() == 0:
-            # print(f"Debug: Failed to get base embeddings for src or tgt at hop {running_k_hop}")
-            return None, {}, None, True
+            print(f"Debug: Failed to get base embeddings for src or tgt at hop {running_k_hop}")
+            return None, {}, None, True, debug_info
         
         # 獲取圖譜中最大的CUI索引值，以確定映射張量的大小
         # 假設 self.g_tensorized['num_nodes'] 是節點總數，索引從 0 到 num_nodes-1
@@ -1356,7 +1362,7 @@ class GraphModel(nn.Module):
             current_path_src_embs_for_encoding = updated_src_embs_from_gin
             # print(f"GIN updated src embs shape: {current_path_src_embs_for_encoding.shape}")
             
-        pruning_threshold_count = 256 # 您設定的篩選路徑數量上限
+        pruning_threshold_count = 512 # 您設定的篩選路徑數量上限
         num_paths_this_hop_before_pruning = num_paths_this_hop # ## NOW THIS IS VALID ##
 
         if num_paths_this_hop > pruning_threshold_count: # Check against initial num_paths_this_hop
@@ -1682,7 +1688,7 @@ class GraphModel(nn.Module):
 
 
         visited_paths_str_dict = {}
-        return all_paths_info, visited_paths_str_dict, next_hop_state, stop_flag
+        return all_paths_info, visited_paths_str_dict, next_hop_state, stop_flag, debug_info
 
 
 class Trainer(nn.Module):
@@ -1715,7 +1721,8 @@ class Trainer(nn.Module):
                  triplet_margin=1.0,
                  early_stopping_patience=3,
                  early_stopping_metric='val_loss',
-                 early_stopping_delta=0.001
+                 early_stopping_delta=0.001,
+                 analyze_pruning=False
                  ):
         super(Trainer, self).__init__()
 
@@ -1726,6 +1733,8 @@ class Trainer(nn.Module):
         self.cui_vocab_str_to_idx = cui_vocab_str_to_idx 
         self.rev_cui_vocab_idx_to_str = {v: k for k, v in cui_vocab_str_to_idx.items()}
         self.top_n_for_exploration = top_n # ## RENAMED for clarity
+        
+        
         
         
         self.loss_type = loss_type
@@ -1798,6 +1807,13 @@ class Trainer(nn.Module):
         logging.info(exp_setting)
         print(exp_setting)
         self.optimizer = None
+        
+        
+        self.analyze_pruning = analyze_pruning
+        if self.analyze_pruning:
+            print("注意：路徑剪枝分析已啟用，可能會輕微影響性能。")
+            self.pruning_stats = {'total_gt_candidates_hop1': 0, 'gt_dropped_hop1': 0, 
+                                  'total_gt_candidates_hop2': 0, 'gt_dropped_hop2': 0}
 
     def create_optimizers(self):
                 
@@ -1873,6 +1889,31 @@ class Trainer(nn.Module):
         # 如果沒有唯一路徑目標 (例如，所有路徑都被過濾掉了，或者 cand_tgt_idx_hop 為空導致的)
         if unique_path_targets_global_indices.numel() == 0:
             return hop_loss
+        
+        # 1. 獲取預測目標和GT目標的嵌入向量
+        predicted_target_embs = self.gmodel._get_embeddings_by_indices(unique_path_targets_global_indices)
+    
+        gt_indices_tensor = self._get_gt_indices_tensor(gt_cuis_str_list_sample)
+        if not gt_indices_tensor.numel() > 0: # 如果沒有GT，所有標籤都為0
+            soft_labels = torch.zeros(predicted_target_embs.size(0), device=self.device)
+        else:
+            gt_target_embs = self.gmodel._get_embeddings_by_indices(gt_indices_tensor)
+
+        # 2. 計算每個預測目標與所有GT目標之間的餘弦相似度
+        # 歸一化嵌入以計算餘弦相似度
+        predicted_target_embs_norm = F.normalize(predicted_target_embs, p=2, dim=1)
+        gt_target_embs_norm = F.normalize(gt_target_embs, p=2, dim=1)
+        
+        # 相似度矩陣 [預測數, GT數]
+        similarity_matrix = torch.matmul(predicted_target_embs_norm, gt_target_embs_norm.t())
+
+        # 3. 為每個預測目標取其與所有GT中的最大相似度作為軟標籤
+        # soft_labels 的形狀為 [預測數]
+        soft_labels, _ = torch.max(similarity_matrix, dim=1)
+        
+        # 確保相似度不會是負數 (雖然餘弦相似度可能為負)
+        # 對於損失函數，通常希望標籤在 [0,1] 區間，可以選擇使用 clamp 或 relu
+        soft_labels = F.relu(soft_labels) 
 
         # 使用 torch_scatter (如果可用) 或 fallback 進行聚合
         if TORCH_SCATTER_AVAILABLE: # TORCH_SCATTER_AVAILABLE 應在類或全局定義
@@ -1926,8 +1967,8 @@ class Trainer(nn.Module):
         # 7. 計算 BCE 損失
         # 確保 aggregated_scores 和 labels 的形狀和元素數量匹配
         if aggregated_scores_for_unique_targets.numel() > 0 and \
-           aggregated_scores_for_unique_targets.size(0) == labels_for_unique_targets.size(0):
-             hop_loss = self.loss_fn_bce(aggregated_scores_for_unique_targets, labels_for_unique_targets)
+           aggregated_scores_for_unique_targets.size(0) == soft_labels.size(0):
+             hop_loss = self.loss_fn_bce(aggregated_scores_for_unique_targets, soft_labels)
         elif aggregated_scores_for_unique_targets.numel() > 0 : # Labels 數量不匹配 (不應發生)
             print(f"警告 (BCE Loss): aggregated_scores ({aggregated_scores_for_unique_targets.size(0)}) 和 labels ({labels_for_unique_targets.size(0)}) 數量不匹配。")
             
@@ -2044,9 +2085,10 @@ class Trainer(nn.Module):
 
             for running_k in range(self.k_hops): # Hop 迴圈
                 if not current_cui_str_list_for_hop and running_k > 0 : break
+                          
                 
                 all_paths_info_hop, _, \
-                next_hop_state_info_for_exploration, stop_flag = self.gmodel.one_iteration(
+                next_hop_state_info_for_exploration, stop_flag, debug_info = self.gmodel.one_iteration(
                     task_emb_sample, current_cui_str_list_for_hop, running_k,
                     context_emb_sample, prev_iter_state_for_next_hop
                 )
@@ -2061,7 +2103,35 @@ class Trainer(nn.Module):
                         gt_cuis_str_list_this_hop.extend(intermediate_target_cuis_batch[i])
                 elif running_k == 1:
                     gt_cuis_str_list_this_hop.extend(hop2_target_cuis_str_batch[i])
+                    
+                gt_indices_tensor_for_analysis = self._get_gt_indices_tensor(list(set(gt_cuis_str_list_this_hop)))
                 gt_cuis_str_list_this_hop = list(set(gt_cuis_str_list_this_hop))
+                
+                
+                if self.analyze_pruning and self.mode == 'eval' and debug_info: # 通常只在驗證集上分析
+                    pre_pruning_targets = debug_info.get('pre_pruning_targets')
+                    
+                    if pre_pruning_targets is not None and pre_pruning_targets.numel() > 0 and gt_indices_tensor_for_analysis.numel() > 0:
+                        post_pruning_targets = all_paths_info_hop.get('tgt_idx') if all_paths_info_hop else None
+                        
+                        if post_pruning_targets is not None:
+                            gt_set = set(gt_indices_tensor_for_analysis.tolist())
+                            pre_set = set(pre_pruning_targets.tolist())
+                            post_set = set(post_pruning_targets.tolist())
+
+                            gt_candidates_before_pruning = gt_set.intersection(pre_set)
+                            gt_candidates_after_pruning = gt_set.intersection(post_set)
+                            
+                            num_gt_candidates = len(gt_candidates_before_pruning)
+                            num_gt_dropped = len(gt_candidates_before_pruning - gt_candidates_after_pruning)
+
+                            if running_k == 0:
+                                self.pruning_stats['total_gt_candidates_hop1'] += num_gt_candidates
+                                self.pruning_stats['gt_dropped_hop1'] += num_gt_dropped
+                            elif running_k == 1:
+                                self.pruning_stats['total_gt_candidates_hop2'] += num_gt_candidates
+                                self.pruning_stats['gt_dropped_hop2'] += num_gt_dropped
+                
 
                 current_hop_bce_loss = torch.tensor(0.0, device=self.device)
                 current_hop_triplet_loss = torch.tensor(0.0, device=self.device)
@@ -2343,6 +2413,10 @@ class Trainer(nn.Module):
         hop1_num_list, final_num_list , hop1_target_num_list, final_target_num_list = [], [], [], []
         
         
+        if self.analyze_pruning:
+            self.pruning_stats = {'total_gt_candidates_hop1': 0, 'gt_dropped_hop1': 0, 
+                                  'total_gt_candidates_hop2': 0, 'gt_dropped_hop2': 0}
+        
         with torch.no_grad():
             for batch in dev_pbar:
                 if batch is None: continue
@@ -2383,7 +2457,20 @@ class Trainer(nn.Module):
         final_target_avg_num = np.mean(final_target_num_list) if final_target_num_list else 0.0
         print(f"hop1_avg_num: {hop1_avg_num}, final_avg_num: {final_avg_num}, hop1_target_avg_num: {hop1_target_avg_num}, final_target_avg_num: {final_target_avg_num}")
         
+        if self.analyze_pruning:
+            print("\n--- Path Pruning Analysis Results ---")
+            total_hop1 = self.pruning_stats['total_gt_candidates_hop1']
+            dropped_hop1 = self.pruning_stats['gt_dropped_hop1']
+            percent_dropped_hop1 = (dropped_hop1 / total_hop1 * 100) if total_hop1 > 0 else 0
+            print(f"Hop 1: Dropped {dropped_hop1} of {total_hop1} GT candidates ({percent_dropped_hop1:.2f}%) due to pruning.")
+            
+            total_hop2 = self.pruning_stats['total_gt_candidates_hop2']
+            dropped_hop2 = self.pruning_stats['gt_dropped_hop2']
+            percent_dropped_hop2 = (dropped_hop2 / total_hop2 * 100) if total_hop2 > 0 else 0
+            print(f"Hop 2: Dropped {dropped_hop2} of {total_hop2} GT candidates ({percent_dropped_hop2:.2f}%) due to pruning.")
+            print("-------------------------------------\n")       
        
+
         return avg_loss, avg_p1, avg_r1, avg_f1_1, avg_p_final, avg_r_final, avg_f1_final
 
 # ====================== Main Block ======================
@@ -2477,6 +2564,7 @@ if __name__ =='__main__':
         cui_weights_dict=None, 
         contrastive_learning=contrastive_flag,
         intermediate=intermediate_loss_flag,
+        score_threshold=0.6,
         save_model_path=model_save_path,
         gnn_update=True, 
         path_encoder_type="Transformer",
@@ -2484,9 +2572,9 @@ if __name__ =='__main__':
         gnn_type="Stack", 
         gin_hidden_dim=gin_hidden_dim_val,
         gin_num_layers=gin_num_layers_val,
-        #input_edge_dim_for_gin=actual_input_edge_dim_for_gin,
         early_stopping_patience=3,
-        early_stopping_metric='val_loss'
+        early_stopping_metric='val_loss',
+        analyze_pruning=True
     )
     print("Trainer instantiated.")
 
