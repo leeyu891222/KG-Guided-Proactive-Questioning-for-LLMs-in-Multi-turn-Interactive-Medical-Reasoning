@@ -120,6 +120,9 @@ class MediQAnnotatedDataset(Dataset):
         return len(self.valid_training_samples)
 
     def __getitem__(self, index):
+        if index >= len(self.valid_training_samples):
+            raise IndexError("Index out of bounds for valid_training_samples")
+            
         sample_info = self.valid_training_samples[index]
         case_id = sample_info["case_id"]
         guaranteed_known_idx = sample_info["guaranteed_known_idx"]
@@ -144,7 +147,7 @@ class MediQAnnotatedDataset(Dataset):
 
         known_texts_list = [atomic_facts[i] for i in sorted(list(known_indices))]
         known_texts_combined = " ".join(known_texts_list) if known_texts_list else "N/A"
-
+        
         input_text_tks = self.tokenizer(known_texts_combined,
                                         truncation=True, padding="max_length",
                                         max_length=512, return_tensors="pt")
@@ -157,36 +160,45 @@ class MediQAnnotatedDataset(Dataset):
                 known_cuis_list_flat.extend(current_fact_cuis)
         known_cuis_list_unique = list(set(known_cuis_list_flat))
         
-        # ## MODIFIED: 創建三個獨立的集合來儲存不同類型的 GT
+        # --- 【修改點 1】將已知CUI列表轉換為集合，以提高查詢效率 ---
+        known_cuis_set_for_filtering = set(known_cuis_list_unique)
+
         hop1_target_cuis_set = set()
         hop2_target_cuis_set = set()
-        intermediate_target_cuis_set = set() # ## ADDED
+        intermediate_target_cuis_set = set()
         
         for k_idx in known_indices:
             for u_idx in unknown_indices:
                 path_key_optional = f"{k_idx}_{u_idx}"
                 if path_key_optional in paths_between_facts:
                     for path_data in paths_between_facts[path_key_optional]:
-                        if not path_data or not isinstance(path_data, list): continue
+                        if not path_data or not isinstance(path_data, list) or len(path_data) < 1: continue
+                        
                         path_len = len(path_data)
                         target_cui_in_path = path_data[-1]
-                        is_valid_cui = isinstance(target_cui_in_path, str) and target_cui_in_path.startswith('C')
+                        is_valid_cui_str = isinstance(target_cui_in_path, str) and target_cui_in_path.startswith('C')
                         
-                        if is_valid_cui and isinstance(facts_cuis[u_idx], list) and \
+                        if is_valid_cui_str and isinstance(facts_cuis[u_idx], list) and \
                            target_cui_in_path in facts_cuis[u_idx]:
                             
-                            # ## MODIFIED: 根據路徑長度將目標 CUI 分配到正確的集合
+                            # --- 【修改點 2】在添加GT之前，檢查最終目標CUI是否已經是已知的 ---
+                            if target_cui_in_path in known_cuis_set_for_filtering:
+                                # 如果最終目標CUI已經在已知集合中，則這不是一條有效的探索路徑GT，跳過。
+                                continue
+                            # --- 修改結束 ---
+
                             if path_len == 3: # 1-hop path
                                 hop1_target_cuis_set.add(target_cui_in_path)
                             elif path_len == 5: # 2-hop path
-                                intermediate_cui = path_data[2] # 中間節點
-                                intermediate_target_cuis_set.add(intermediate_cui) # ## ADDED
-                                hop2_target_cuis_set.add(target_cui_in_path) # 最終目標
+                                intermediate_cui = path_data[2]
+                                if isinstance(intermediate_cui, str) and intermediate_cui.startswith('C'):
+                                    # 根據您的要求，中間節點可以是已知的，所以這裡不過濾。
+                                    intermediate_target_cuis_set.add(intermediate_cui)
+                                
+                                # 2跳路徑的最終目標已經在上面被過濾過了。
+                                hop2_target_cuis_set.add(target_cui_in_path)
         
-        # ## MODIFIED: 修改返回 None 的條件。
-        # 現在，一個樣本被視為無效，如果它連一個 1-hop 或 2-hop 的 GT 都沒有。
-        # 訓練器將決定如何使用這些GT。例如，如果只訓練2-hop，那麼 hop2_target_cuis 為空就可能是個問題。
-        # 為了通用性，我們只要至少有一個GT就返回。
+        # (此處的返回邏輯保持不變)
         if not hop1_target_cuis_set and not hop2_target_cuis_set:
             return None
 
@@ -198,7 +210,7 @@ class MediQAnnotatedDataset(Dataset):
             "known_cuis": known_cuis_list_unique,
             "hop1_target_cuis": list(hop1_target_cuis_set),
             "hop2_target_cuis": list(hop2_target_cuis_set),
-            "intermediate_target_cuis": list(intermediate_target_cuis_set), # ## ADDED
+            "intermediate_target_cuis": list(intermediate_target_cuis_set),
         }
 
 

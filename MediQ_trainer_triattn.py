@@ -115,6 +115,9 @@ class MediQAnnotatedDataset(Dataset):
         return len(self.valid_training_samples)
 
     def __getitem__(self, index):
+        if index >= len(self.valid_training_samples):
+            raise IndexError("Index out of bounds for valid_training_samples")
+            
         sample_info = self.valid_training_samples[index]
         case_id = sample_info["case_id"]
         guaranteed_known_idx = sample_info["guaranteed_known_idx"]
@@ -139,7 +142,7 @@ class MediQAnnotatedDataset(Dataset):
 
         known_texts_list = [atomic_facts[i] for i in sorted(list(known_indices))]
         known_texts_combined = " ".join(known_texts_list) if known_texts_list else "N/A"
-
+        
         input_text_tks = self.tokenizer(known_texts_combined,
                                         truncation=True, padding="max_length",
                                         max_length=512, return_tensors="pt")
@@ -152,36 +155,45 @@ class MediQAnnotatedDataset(Dataset):
                 known_cuis_list_flat.extend(current_fact_cuis)
         known_cuis_list_unique = list(set(known_cuis_list_flat))
         
-        # ## MODIFIED: 創建三個獨立的集合來儲存不同類型的 GT
+        # --- 【修改點 1】將已知CUI列表轉換為集合，以提高查詢效率 ---
+        known_cuis_set_for_filtering = set(known_cuis_list_unique)
+
         hop1_target_cuis_set = set()
         hop2_target_cuis_set = set()
-        intermediate_target_cuis_set = set() # ## ADDED
+        intermediate_target_cuis_set = set()
         
         for k_idx in known_indices:
             for u_idx in unknown_indices:
                 path_key_optional = f"{k_idx}_{u_idx}"
                 if path_key_optional in paths_between_facts:
                     for path_data in paths_between_facts[path_key_optional]:
-                        if not path_data or not isinstance(path_data, list): continue
+                        if not path_data or not isinstance(path_data, list) or len(path_data) < 1: continue
+                        
                         path_len = len(path_data)
                         target_cui_in_path = path_data[-1]
-                        is_valid_cui = isinstance(target_cui_in_path, str) and target_cui_in_path.startswith('C')
+                        is_valid_cui_str = isinstance(target_cui_in_path, str) and target_cui_in_path.startswith('C')
                         
-                        if is_valid_cui and isinstance(facts_cuis[u_idx], list) and \
+                        if is_valid_cui_str and isinstance(facts_cuis[u_idx], list) and \
                            target_cui_in_path in facts_cuis[u_idx]:
                             
-                            # ## MODIFIED: 根據路徑長度將目標 CUI 分配到正確的集合
+                            # --- 【修改點 2】在添加GT之前，檢查最終目標CUI是否已經是已知的 ---
+                            if target_cui_in_path in known_cuis_set_for_filtering:
+                                # 如果最終目標CUI已經在已知集合中，則這不是一條有效的探索路徑GT，跳過。
+                                continue
+                            # --- 修改結束 ---
+
                             if path_len == 3: # 1-hop path
                                 hop1_target_cuis_set.add(target_cui_in_path)
                             elif path_len == 5: # 2-hop path
-                                intermediate_cui = path_data[2] # 中間節點
-                                intermediate_target_cuis_set.add(intermediate_cui) # ## ADDED
-                                hop2_target_cuis_set.add(target_cui_in_path) # 最終目標
+                                intermediate_cui = path_data[2]
+                                if isinstance(intermediate_cui, str) and intermediate_cui.startswith('C'):
+                                    # 根據您的要求，中間節點可以是已知的，所以這裡不過濾。
+                                    intermediate_target_cuis_set.add(intermediate_cui)
+                                
+                                # 2跳路徑的最終目標已經在上面被過濾過了。
+                                hop2_target_cuis_set.add(target_cui_in_path)
         
-        # ## MODIFIED: 修改返回 None 的條件。
-        # 現在，一個樣本被視為無效，如果它連一個 1-hop 或 2-hop 的 GT 都沒有。
-        # 訓練器將決定如何使用這些GT。例如，如果只訓練2-hop，那麼 hop2_target_cuis 為空就可能是個問題。
-        # 為了通用性，我們只要至少有一個GT就返回。
+        # (此處的返回邏輯保持不變)
         if not hop1_target_cuis_set and not hop2_target_cuis_set:
             return None
 
@@ -193,7 +205,7 @@ class MediQAnnotatedDataset(Dataset):
             "known_cuis": known_cuis_list_unique,
             "hop1_target_cuis": list(hop1_target_cuis_set),
             "hop2_target_cuis": list(hop2_target_cuis_set),
-            "intermediate_target_cuis": list(intermediate_target_cuis_set), # ## ADDED
+            "intermediate_target_cuis": list(intermediate_target_cuis_set),
         }
 
 
@@ -358,6 +370,71 @@ def collate_fn_mediq_preprocessed(batch):
     
     return collated_batch
 
+class FocalLoss(nn.Module):
+    """
+    Focal Loss 的 PyTorch 實現，用於二元分類任務。
+    它旨在解決類別不均衡問題，通過降低對易分類樣本的權重，
+    讓模型更專注於難分類的樣本。
+    """
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        """
+        Args:
+            alpha (float): 平衡正負樣本權重的因子，範圍在 [0, 1]。
+                           常用於處理正負樣本數量不均衡。
+            gamma (float): 聚焦參數，用於調節對難易樣本的關注程度。
+                           gamma > 0 可以降低對易分類樣本的損失貢獻。
+            reduction (str): 指定如何對輸出的損失進行聚合，
+                             可選 'mean', 'sum', 'none'。
+        """
+        super(FocalLoss, self).__init__()
+        if not (0 <= alpha <= 1):
+            raise ValueError("alpha 參數必須在 0 到 1 之間")
+        if not (gamma >= 0):
+            raise ValueError("gamma 參數必須大於等於 0")
+            
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        """
+        計算 Focal Loss。
+        Args:
+            inputs (torch.Tensor): 模型的原始輸出 (logits)，形狀為 [N, *]。
+            targets (torch.Tensor): 真實標籤 (0或1)，形狀與 inputs 相同。
+        Returns:
+            torch.Tensor: 計算出的損失。
+        """
+        # 使用 BCEWithLogitsLoss 來獲得更好的數值穩定性
+        # reduction='none' 讓我們能對每個元素的損失進行後續操作
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+
+        # 獲取模型預測為正類的機率
+        p = torch.sigmoid(inputs)
+
+        # 計算 p_t，即模型對真實類別的預測機率
+        # 如果 target 是 1，p_t = p
+        # 如果 target 是 0，p_t = 1 - p
+        p_t = p * targets + (1 - p) * (1 - targets)
+
+        # 計算 focal loss 的核心項：(1 - p_t)^gamma
+        focal_term = (1 - p_t).pow(self.gamma)
+
+        # 計算 alpha 項，用於平衡正負樣本
+        # 如果 target 是 1，alpha_t = alpha
+        # 如果 target 是 0，alpha_t = 1 - alpha
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+
+        # 計算最終的 focal loss
+        loss = alpha_t * focal_term * bce_loss
+
+        # 根據設定的 reduction 方式進行聚合
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else: # 'none'
+            return loss
 
 # ====================== gnn_utils ===================
 # Graph utils functions 
@@ -1620,12 +1697,15 @@ class Trainer(nn.Module):
                  device,
                  nums_of_epochs,
                  LR,
+                 loss_type='BCE', # 新增：可選 'BCE' 或 'Focal'
+                 focal_alpha=0.25, # 新增：Focal Loss 的 alpha
+                 focal_gamma=2.0,  # 新增：Focal Loss 的 gamma
                  cui_weights_dict=None,
                  contrastive_learning=True,
                  save_model_path=None,
                  gnn_update=True,
                  intermediate=False, 
-                 score_threshold=0.9, # ## ADDED: 評分閾值
+                 score_threshold=0.5, # ## ADDED: 評分閾值
                  distance_metric="Cosine",
                  path_encoder_type="MLP",
                  path_ranker_type="Flat",
@@ -1646,6 +1726,19 @@ class Trainer(nn.Module):
         self.cui_vocab_str_to_idx = cui_vocab_str_to_idx 
         self.rev_cui_vocab_idx_to_str = {v: k for k, v in cui_vocab_str_to_idx.items()}
         self.top_n_for_exploration = top_n # ## RENAMED for clarity
+        
+        
+        self.loss_type = loss_type
+        if self.loss_type.upper() == 'FOCAL':
+            print(f"Using Focal Loss with alpha={focal_alpha}, gamma={focal_gamma}")
+            # 將實例化的 FocalLoss 賦值給 self.loss_fn_bce
+            self.loss_fn_bce = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        elif self.loss_type.upper() == 'BCE':
+            print("Using standard BCEWithLogitsLoss")
+            self.loss_fn_bce = nn.BCEWithLogitsLoss()
+        else:
+            raise ValueError(f"不支援的損失函數類型: {self.loss_type}。請選擇 'BCE' 或 'Focal'。")
+        
 
         self.gmodel = GraphModel(
             g_nx=g_nx, 
@@ -1679,7 +1772,7 @@ class Trainer(nn.Module):
         self.triplet_margin = triplet_margin
         self.score_threshold = score_threshold # ## ADDED
 
-        self.loss_fn_bce = nn.BCEWithLogitsLoss()
+        
         self.save_model_path = save_model_path
         
         self.early_stopping_patience = early_stopping_patience
@@ -1709,15 +1802,26 @@ class Trainer(nn.Module):
     def create_optimizers(self):
                 
         no_decay = ["bias", "LayerNorm.weight"]
+        main_lr = self.LR
+        encoder_lr = 1e-6 # 假設
+        weight_decay_val = self.weight_decay # 例如 0.01
+        
         optimizer_grouped_parameters = [
-            {'params': [p for n, p in self.encoder.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad], 'weight_decay': self.weight_decay},
-            {'params': [p for n, p in self.encoder.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad], 'weight_decay': 0.0},
-            {'params': [p for n, p in self.gmodel.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad], 'weight_decay': self.weight_decay},
-            {'params': [p for n, p in self.gmodel.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad], 'weight_decay': 0.0}
+            # --- gmodel 參數組 (使用主學習率) ---
+            {'params': [p for n, p in self.gmodel.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad], 
+            'weight_decay': weight_decay_val, 'lr': main_lr},
+            {'params': [p for n, p in self.gmodel.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad], 
+            'weight_decay': 0.0, 'lr': main_lr},
+            
+            # --- encoder (SapBERT) 參數組 (使用較小的學習率) ---
+            {'params': [p for n, p in self.encoder.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad], 
+            'weight_decay': weight_decay_val, 'lr': encoder_lr},
+            {'params': [p for n, p in self.encoder.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad], 
+            'weight_decay': 0.0, 'lr': encoder_lr}
         ]
-        effective_lr = self.LR[0] if isinstance(self.LR, list) else self.LR
-        print(f"Using Learning Rate: {effective_lr}")
-        self.optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=effective_lr, eps=self.adam_epsilon)
+        
+        print(f"Using Learning Rate: {main_lr}")
+        self.optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=main_lr, eps=self.adam_epsilon)
         print("Optimizer created.")
 
 
@@ -2338,7 +2442,7 @@ if __name__ =='__main__':
     epochs = 100 
     LR = 1e-5 
     intermediate_loss_flag = True 
-    contrastive_flag = True 
+    contrastive_flag = False 
     batch_size = 4 
     
     gin_hidden_dim_val = hdim 
@@ -2367,12 +2471,15 @@ if __name__ =='__main__':
         device=device,
         nums_of_epochs=epochs, 
         LR=LR,
+        loss_type="FOCAL",
+        focal_alpha=0.25,
+        focal_gamma=2.0,
         cui_weights_dict=None, 
         contrastive_learning=contrastive_flag,
         intermediate=intermediate_loss_flag,
         save_model_path=model_save_path,
         gnn_update=True, 
-        path_encoder_type="MLP",
+        path_encoder_type="Transformer",
         path_ranker_type="Flat",
         gnn_type="Stack", 
         gin_hidden_dim=gin_hidden_dim_val,
