@@ -1233,7 +1233,8 @@ class GraphModel(nn.Module):
                       current_cui_str_list, # List of CUI strings for current hop's start nodes
                       running_k_hop, # Current hop number (0 for 1st hop)
                       context_emb_batch=None, # Shape [1, hdim] or [hdim]
-                      prev_iteration_state=None # Dict: {'cand_src_orig_idx': Tensor, 'cand_tgt_idx': Tensor}
+                      prev_iteration_state=None, # Dict: {'cand_src_orig_idx': Tensor, 'cand_tgt_idx': Tensor}
+                      gt_indices_for_pruning=None
                      ):
         stop_flag = False
         
@@ -1369,49 +1370,94 @@ class GraphModel(nn.Module):
             # print(f"  Hop {running_k_hop}: Path count {num_paths_this_hop} exceeds threshold {pruning_threshold_count}. Applying pruning.")
 
             if unique_tgt_embs.numel() > 0 : # 確保 unique_tgt_embs 不是空的
-                local_indices_for_pruning_targets = map_global_tgt_to_local_tensor[cand_tgt_idx_hop] # 直接用映射張量
-
-                # 處理可能的 -1 索引 (如果 cand_tgt_idx_hop 中有不在 unique_hop_tgt_indices 的索引)
-                valid_mask_for_pruning_targets = (local_indices_for_pruning_targets != -1)
-                if not torch.all(valid_mask_for_pruning_targets):
-                    print(f"警告 (Pruning Input): cand_tgt_idx_hop 中存在無效索引，將被過濾或導致錯誤。")
-                    # 應對策略：只對有效索引的路徑進行後續操作，或者如果這是嚴重錯誤則拋出異常
-                    # 這裡假設如果出現-1，對應的相似度會很低或被忽略，或者 topk 會處理
-                    # 為了安全，最好確保所有索引都有效，或者過濾掉帶-1索引的路徑
-                    # local_indices_for_pruning_targets = local_indices_for_pruning_targets[valid_mask_for_pruning_targets]
-                    # expanded_task_emb 和 path_specific_tgt_embs_for_pruning 也需要對應篩選
-                    # 這會使邏輯複雜。更簡單的是假設 cand_tgt_idx_hop 中的索引總能在 map_global_tgt_to_local_tensor 中找到有效映射。
-                    if torch.any(local_indices_for_pruning_targets == -1):
-                        raise ValueError("Pruning Input: 發現無效的-1索引，cand_tgt_idx_hop 與 unique_hop_tgt_indices 不一致。")
-
-                path_specific_tgt_embs_for_pruning = unique_tgt_embs[local_indices_for_pruning_targets]
-            
-                expanded_task_emb_for_pruning = task_emb_batch.expand(path_specific_tgt_embs_for_pruning.size(0), -1)
-                target_similarity_scores = F.cosine_similarity(path_specific_tgt_embs_for_pruning, expanded_task_emb_for_pruning, dim=1)
+                if gt_indices_for_pruning is not None and gt_indices_for_pruning.numel() > 0:
+                    # 1. 識別並分離出 GT 路徑
+                    is_gt_mask = torch.isin(cand_tgt_idx_hop, gt_indices_for_pruning)
+                    gt_path_indices = torch.where(is_gt_mask)[0]
+                    non_gt_path_indices = torch.where(~is_gt_mask)[0]
+                    
+                    # 2. 確定需要從非 GT 路徑中保留多少個
+                    num_to_keep_from_non_gt = pruning_threshold_count - len(gt_path_indices)
+                    
+                    if num_to_keep_from_non_gt > 0 and len(non_gt_path_indices) > 0:
+                        # 3. 只對非GT路徑計算相似度分數並選取Top-K
+                        non_gt_cand_tgt_idx = cand_tgt_idx_hop[non_gt_path_indices]
+                        
+                        # 獲取非GT目標的嵌入
+                        # (這部分需要從之前的 unique_tgt_embs 中索引，此處為簡化邏輯)
+                        # 假設 map_global_tgt_to_local_tensor 和 unique_tgt_embs 已準備好
+                        local_indices = map_global_tgt_to_local_tensor[non_gt_cand_tgt_idx]
+                        valid_mask = (local_indices != -1)
+                        path_specific_tgt_embs_for_pruning = unique_tgt_embs[local_indices[valid_mask]]
+                        
+                        expanded_task_emb = task_emb_batch.expand(path_specific_tgt_embs_for_pruning.size(0), -1)
+                        non_gt_similarity_scores = F.cosine_similarity(path_specific_tgt_embs_for_pruning, expanded_task_emb, dim=1)
+                        
+                        num_to_sample = min(num_to_keep_from_non_gt, len(non_gt_similarity_scores))
+                        _, top_k_relative_indices = torch.topk(non_gt_similarity_scores, num_to_sample)
+                        
+                        # 獲取在原始非GT索引列表中的絕對索引
+                        top_k_non_gt_indices_absolute = non_gt_path_indices[valid_mask][top_k_relative_indices]
+                        
+                        # 4. 合併GT路徑和被選中的非GT路徑的索引
+                        final_indices_to_keep = torch.cat([gt_path_indices, top_k_non_gt_indices_absolute])
+                    else:
+                        # 如果GT路徑就已經超過閾值，或沒有非GT路徑，則只保留GT路徑
+                        final_indices_to_keep = gt_path_indices
+                    
+                    # 5. 使用最終索引來篩選所有相關張量
+                    cand_src_idx_hop = cand_src_idx_hop[final_indices_to_keep]
+                    cand_tgt_idx_hop = cand_tgt_idx_hop[final_indices_to_keep]
+                    cand_edge_idx_hop = cand_edge_idx_hop[final_indices_to_keep]
+                    if mem_orig_src_idx_hop is not None: mem_orig_src_idx_hop = mem_orig_src_idx_hop[final_indices_to_keep]
+                    if mem_first_edge_idx_hop is not None: mem_first_edge_idx_hop = mem_first_edge_idx_hop[final_indices_to_keep]
+                    path_edge_embs_for_gin_and_path_enc = path_edge_embs_for_gin_and_path_enc[final_indices_to_keep]
+                    num_paths_this_hop = cand_src_idx_hop.size(0)
+                else:    
                 
-                # Ensure pruning_threshold_count isn't larger than available paths
-                actual_pruning_count = min(pruning_threshold_count, target_similarity_scores.size(0))
-                if actual_pruning_count > 0:
-                    _, top_k_pruning_indices = torch.topk(target_similarity_scores, actual_pruning_count)
+                    local_indices_for_pruning_targets = map_global_tgt_to_local_tensor[cand_tgt_idx_hop] # 直接用映射張量
 
-                    cand_src_idx_hop = cand_src_idx_hop[top_k_pruning_indices]
-                    cand_tgt_idx_hop = cand_tgt_idx_hop[top_k_pruning_indices]
-                    cand_edge_idx_hop = cand_edge_idx_hop[top_k_pruning_indices]
-                    if mem_orig_src_idx_hop is not None:
-                        mem_orig_src_idx_hop = mem_orig_src_idx_hop[top_k_pruning_indices]
-                    if mem_first_edge_idx_hop is not None:
-                        mem_first_edge_idx_hop = mem_first_edge_idx_hop[top_k_pruning_indices]
+                    # 處理可能的 -1 索引 (如果 cand_tgt_idx_hop 中有不在 unique_hop_tgt_indices 的索引)
+                    valid_mask_for_pruning_targets = (local_indices_for_pruning_targets != -1)
+                    if not torch.all(valid_mask_for_pruning_targets):
+                        print(f"警告 (Pruning Input): cand_tgt_idx_hop 中存在無效索引，將被過濾或導致錯誤。")
+                        # 應對策略：只對有效索引的路徑進行後續操作，或者如果這是嚴重錯誤則拋出異常
+                        # 這裡假設如果出現-1，對應的相似度會很低或被忽略，或者 topk 會處理
+                        # 為了安全，最好確保所有索引都有效，或者過濾掉帶-1索引的路徑
+                        # local_indices_for_pruning_targets = local_indices_for_pruning_targets[valid_mask_for_pruning_targets]
+                        # expanded_task_emb 和 path_specific_tgt_embs_for_pruning 也需要對應篩選
+                        # 這會使邏輯複雜。更簡單的是假設 cand_tgt_idx_hop 中的索引總能在 map_global_tgt_to_local_tensor 中找到有效映射。
+                        if torch.any(local_indices_for_pruning_targets == -1):
+                            raise ValueError("Pruning Input: 發現無效的-1索引，cand_tgt_idx_hop 與 unique_hop_tgt_indices 不一致。")
+
+                    path_specific_tgt_embs_for_pruning = unique_tgt_embs[local_indices_for_pruning_targets]
+                
+                    expanded_task_emb_for_pruning = task_emb_batch.expand(path_specific_tgt_embs_for_pruning.size(0), -1)
+                    target_similarity_scores = F.cosine_similarity(path_specific_tgt_embs_for_pruning, expanded_task_emb_for_pruning, dim=1)
                     
-                    path_edge_embs_for_gin_and_path_enc = path_edge_embs_for_gin_and_path_enc[top_k_pruning_indices]
-                    
-                    num_paths_this_hop = cand_src_idx_hop.size(0) # ## UPDATE num_paths_this_hop AFTER PRUNING ##
-                    # print(f"  Hop {running_k_hop}: Pruned from {num_paths_this_hop_before_pruning} to {num_paths_this_hop} paths.")
-                else: # No paths left after trying to select top_k (e.g. target_similarity_scores was empty)
-                    # print(f"  Hop {running_k_hop}: Pruning resulted in 0 paths to keep.")
-                    # Set all path tensors to empty
-                    cand_src_idx_hop = torch.empty(0, dtype=torch.long, device=self.device)
-                    # ... set other cand_... and mem_... tensors to empty as well ...
-                    num_paths_this_hop = 0
+                    # Ensure pruning_threshold_count isn't larger than available paths
+                    actual_pruning_count = min(pruning_threshold_count, target_similarity_scores.size(0))
+                    if actual_pruning_count > 0:
+                        _, top_k_pruning_indices = torch.topk(target_similarity_scores, actual_pruning_count)
+
+                        cand_src_idx_hop = cand_src_idx_hop[top_k_pruning_indices]
+                        cand_tgt_idx_hop = cand_tgt_idx_hop[top_k_pruning_indices]
+                        cand_edge_idx_hop = cand_edge_idx_hop[top_k_pruning_indices]
+                        if mem_orig_src_idx_hop is not None:
+                            mem_orig_src_idx_hop = mem_orig_src_idx_hop[top_k_pruning_indices]
+                        if mem_first_edge_idx_hop is not None:
+                            mem_first_edge_idx_hop = mem_first_edge_idx_hop[top_k_pruning_indices]
+                        
+                        path_edge_embs_for_gin_and_path_enc = path_edge_embs_for_gin_and_path_enc[top_k_pruning_indices]
+                        
+                        num_paths_this_hop = cand_src_idx_hop.size(0) # ## UPDATE num_paths_this_hop AFTER PRUNING ##
+                        # print(f"  Hop {running_k_hop}: Pruned from {num_paths_this_hop_before_pruning} to {num_paths_this_hop} paths.")
+                    else: # No paths left after trying to select top_k (e.g. target_similarity_scores was empty)
+                        # print(f"  Hop {running_k_hop}: Pruning resulted in 0 paths to keep.")
+                        # Set all path tensors to empty
+                        cand_src_idx_hop = torch.empty(0, dtype=torch.long, device=self.device)
+                        # ... set other cand_... and mem_... tensors to empty as well ...
+                        num_paths_this_hop = 0
 
             else: # unique_tgt_embs was empty, cannot perform similarity pruning
                 print(f"  Hop {running_k_hop}: Skipping pruning because unique_tgt_embs is empty.")
@@ -1722,6 +1768,7 @@ class Trainer(nn.Module):
                  early_stopping_patience=3,
                  early_stopping_metric='val_loss',
                  early_stopping_delta=0.001,
+                 lambda_triplet=0.2,
                  analyze_pruning=False
                  ):
         super(Trainer, self).__init__()
@@ -1780,7 +1827,7 @@ class Trainer(nn.Module):
         self.contrastive_learning = contrastive_learning
         self.triplet_margin = triplet_margin
         self.score_threshold = score_threshold # ## ADDED
-
+        self.lambda_triplet = lambda_triplet
         
         self.save_model_path = save_model_path
         
@@ -1982,26 +2029,23 @@ class Trainer(nn.Module):
            all_paths_info_hop['encoded_embeddings'].numel() == 0 or not gt_cuis_str_list_sample:
             return triplet_loss
 
-        path_embeddings = all_paths_info_hop['encoded_embeddings'] # [num_paths, hdim]
+        # path_embeddings = all_paths_info_hop['encoded_embeddings'] # [num_paths, hdim]
         path_target_global_indices = all_paths_info_hop['tgt_idx']   # [num_paths] (GLOBAL CUI INDICES)
 
-        gt_indices_tensor = self._get_gt_indices_tensor(gt_cuis_str_list_sample) # 返回 Tensor
+        target_embeddings = self.gmodel._get_embeddings_by_indices(path_target_global_indices)
+        
+        gt_indices_tensor = self._get_gt_indices_tensor(gt_cuis_str_list_sample)
+        if not gt_indices_tensor.numel() > 0: return triplet_loss
 
-        if not gt_indices_tensor.numel() > 0: # 如果沒有 GT，則無法區分正負樣本
-            return triplet_loss # triplet_loss 初始化為 0.0
+        positive_indices_mask = torch.isin(path_target_global_indices, gt_indices_tensor)
+        negative_indices_mask = ~positive_indices_mask
 
-        # ## MODIFIED: 使用 torch.isin() 向量化正樣本掩碼生成
-        if path_target_global_indices.numel() > 0: # 確保有路徑目標可以判斷
-            positive_indices_mask = torch.isin(path_target_global_indices, gt_indices_tensor)
-            negative_indices_mask = ~positive_indices_mask
-        else: # 如果沒有路徑目標，則沒有正負樣本
-            return triplet_loss
-
-        positive_embs = path_embeddings[positive_indices_mask]
-        negative_embs = path_embeddings[negative_indices_mask]
+        positive_embs = target_embeddings[positive_indices_mask]
+        negative_embs = target_embeddings[negative_indices_mask]
 
         if positive_embs.numel() == 0 or negative_embs.numel() == 0:
-            return triplet_loss # Need at least one positive and one negative
+            return triplet_loss
+
 
         # Simplified Triplet: Anchor vs Random Positive vs Random Negative
         # For more robust triplet loss, you might sample multiple triplets
@@ -2085,12 +2129,21 @@ class Trainer(nn.Module):
 
             for running_k in range(self.k_hops): # Hop 迴圈
                 if not current_cui_str_list_for_hop and running_k > 0 : break
-                          
                 
+                gt_cuis_str_list_this_hop = []
+                if running_k == 0:
+                    gt_cuis_str_list_this_hop.extend(hop1_target_cuis_str_batch[i])
+                    if self.intermediate:
+                        gt_cuis_str_list_this_hop.extend(intermediate_target_cuis_batch[i])
+                elif running_k == 1:
+                    gt_cuis_str_list_this_hop.extend(hop2_target_cuis_str_batch[i])
+                          
+                gt_indices_tensor_for_pruning = self._get_gt_indices_tensor(list(set(gt_cuis_str_list_this_hop)))
                 all_paths_info_hop, _, \
                 next_hop_state_info_for_exploration, stop_flag, debug_info = self.gmodel.one_iteration(
                     task_emb_sample, current_cui_str_list_for_hop, running_k,
-                    context_emb_sample, prev_iter_state_for_next_hop
+                    context_emb_sample, prev_iter_state_for_next_hop,
+                    gt_indices_for_pruning=gt_indices_tensor_for_pruning if self.training else None
                 )
 
                 if stop_flag or all_paths_info_hop is None: break
@@ -2143,7 +2196,7 @@ class Trainer(nn.Module):
                         current_hop_triplet_loss = self.compute_triplet_loss_for_hop(
                             anchor_for_triplet, all_paths_info_hop, gt_cuis_str_list_this_hop
                         )
-                current_hop_total_loss = current_hop_bce_loss + current_hop_triplet_loss
+                current_hop_total_loss = current_hop_bce_loss + self.lambda_triplet * current_hop_triplet_loss
                 sample_loss_this_item = sample_loss_this_item + current_hop_total_loss
                 
                 # --- ## MODIFIED: 基於閾值篩選高質量預測，並執行路徑取代 ---
