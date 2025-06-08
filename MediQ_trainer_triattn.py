@@ -2332,6 +2332,8 @@ class Trainer(nn.Module):
             
             num_pred = len(pred_cuis)
             num_gold = len(gold_cuis)
+            if num_gold == 0: continue
+            
             num_intersect = len(gold_cuis.intersection(pred_cuis))
 
             precision = num_intersect / num_pred if num_pred > 0 else 0.0
@@ -2617,7 +2619,7 @@ if __name__ =='__main__':
         cui_weights_dict=None, 
         contrastive_learning=contrastive_flag,
         intermediate=intermediate_loss_flag,
-        score_threshold=0.6,
+        score_threshold=0.8,
         save_model_path=model_save_path,
         gnn_update=True, 
         path_encoder_type="Transformer",
@@ -2627,7 +2629,8 @@ if __name__ =='__main__':
         gin_num_layers=gin_num_layers_val,
         early_stopping_patience=3,
         early_stopping_metric='val_loss',
-        analyze_pruning=True
+        lambda_triplet=0.01,
+        analyze_pruning=False
     )
     print("Trainer instantiated.")
 
