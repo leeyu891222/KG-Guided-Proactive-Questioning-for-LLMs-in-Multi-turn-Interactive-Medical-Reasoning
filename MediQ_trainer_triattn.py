@@ -48,7 +48,7 @@ except ImportError:
     
 class MediQAnnotatedDataset(Dataset):
     def __init__(self, annotation_file_path, tokenizer, random_seed=2023, min_facts_for_sampling=2):
-        # ... __init__ 的前半部分與之前相同，無需修改 ...
+        
         print(f"載入並預處理標註數據: {annotation_file_path}")
         self.min_facts_for_sampling = max(2, min_facts_for_sampling)
         self.tokenizer = tokenizer
@@ -1975,16 +1975,7 @@ class Trainer(nn.Module):
         else: # 默認 val_loss
             self.best_metric_val = float('inf')
             print(f"Warning: early_stopping_metric '{early_stopping_metric}' not recognized. Defaulting to 'val_loss'.")
-
-
-        print("**** ============= TRAINER (MediQ Tensorized GModel with Thresholding) ============= **** ")
-        exp_setting = (f"TRAINER SETUP: SCORE_THRESHOLD: {self.score_threshold}\n"
-                       f"INTERMEDIATE LOSS SUPERVISION: {self.intermediate}\n"
-                       f"CONTRASTIVE LEARNING: {self.contrastive_learning}\n"
-                       # ... (可以加入更多超參數到日誌中)
-                      )
-        logging.info(exp_setting)
-        print(exp_setting)
+       
         
         self.scheduler_type = scheduler_type
         self.scheduler_patience = scheduler_patience
@@ -1999,6 +1990,18 @@ class Trainer(nn.Module):
             print("注意：路徑剪枝分析已啟用，可能會輕微影響性能。")
             self.pruning_stats = {'total_gt_candidates_hop1': 0, 'gt_dropped_hop1': 0, 
                                   'total_gt_candidates_hop2': 0, 'gt_dropped_hop2': 0}
+            
+            
+        print("**** ============= TRAINER (MediQ Tensorized GModel with Thresholding) ============= **** ")
+        exp_setting = (f"TRAINER SETUP: SCORE_THRESHOLD: {self.score_threshold}\n"
+                       f"INTERMEDIATE LOSS SUPERVISION: {self.intermediate}\n"
+                       f"CONTRASTIVE LEARNING: {self.contrastive_learning}\n"
+                       f"PATH ENCODER TYPE: {path_encoder_type}\n"
+                       f"PATH RANKER TYPE: {path_ranker_type}\n"
+                       f"SCHEDULER TYPE: {scheduler_type}\n"
+                      )
+        logging.info(exp_setting)
+        print(exp_setting)
 
     def create_optimizers(self):
                 
@@ -2505,7 +2508,7 @@ class Trainer(nn.Module):
                 mode='min' if self.early_stopping_metric == 'val_loss' else 'max',
                 factor=self.scheduler_factor,
                 patience=self.scheduler_patience,
-                verbose=True
+                # verbose=True
             )
             print(f"ReduceLROnPlateau scheduler created: mode='{'min' if self.early_stopping_metric == 'val_loss' else 'max'}', patience={self.scheduler_patience}, factor={self.scheduler_factor}.")
         elif self.scheduler_type == 'warmup':
@@ -2800,7 +2803,7 @@ if __name__ =='__main__':
         gnn_update=True, 
         path_encoder_type="Transformer",
         path_ranker_type="Flat",
-        gnn_type="GAT", 
+        gnn_type="STACK", 
         gin_hidden_dim=gin_hidden_dim_val,
         gin_num_layers=gin_num_layers_val,
         early_stopping_patience=5,
