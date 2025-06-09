@@ -8,8 +8,8 @@ import torch
 #from torch.autograd import Variable
 import torch.nn as nn
 import torch.nn.functional as F
-import math 
-from transformers import AutoTokenizer, AutoModel # Assuming tokenizer is loaded elsewhere or passed in
+
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 import pandas as pd 
 import json
 from tqdm import tqdm
@@ -17,7 +17,6 @@ import argparse
 import logging
 import datetime
 import random
-import re
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import pickle
@@ -30,7 +29,7 @@ from collections import OrderedDict, defaultdict
 # tokenizer = AutoTokenizer.from_pretrained("cambridgeltl/SapBERT-from-PubMedBERT-fulltext") # Or your model path
 # Try to import torch_scatter, if not available, print a warning
 try:
-    from torch_scatter import scatter_add, scatter_max
+    from torch_scatter import scatter_add, scatter_max, scatter_softmax
     TORCH_SCATTER_AVAILABLE = True
     print("torch_scatter is available.")
 except ImportError:
@@ -916,6 +915,91 @@ class NodeAggregateGIN(nn.Module):
         return updated_src_features, unique_src_to_process_indices # Return updated features and their global indices
 
 
+class GATLayer(nn.Module):
+    """
+    單層的圖注意力網路 (GAT) 實現。
+    """
+    def __init__(self, in_features, out_features, n_heads, concat=True, dropout=0.1, leaky_relu_negative_slope=0.2):
+        super(GATLayer, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.n_heads = n_heads
+        self.concat = concat
+
+        # 為每個頭創建獨立的線性變換層和注意力機制參數
+        self.W = nn.Linear(in_features, n_heads * out_features, bias=False)
+        self.a = nn.Parameter(torch.Tensor(n_heads, 2 * out_features))
+
+        self.leaky_relu = nn.LeakyReLU(leaky_relu_negative_slope)
+        self.dropout = nn.Dropout(dropout)
+        self.softmax = nn.Softmax(dim=1) # 將在 scatter_softmax 中使用
+
+        nn.init.xavier_uniform_(self.W.weight, gain=1.414)
+        nn.init.xavier_uniform_(self.a.data, gain=1.414)
+
+    def forward(self, h, edge_index):
+        """
+        Args:
+            h (Tensor): 節點特徵矩陣，形狀 [num_nodes, in_features]
+            edge_index (Tensor): 邊索引，形狀 [2, num_edges]
+        """
+        if not TORCH_SCATTER_AVAILABLE:
+            raise ImportError("GATLayer requires torch_scatter for efficient operation.")
+
+        # 1. 對節點特徵進行線性變換
+        h_transformed = self.W(h) # [num_nodes, n_heads * out_features]
+        h_transformed = h_transformed.view(-1, self.n_heads, self.out_features) # [num_nodes, n_heads, out_features]
+        
+        source_nodes_features = h_transformed[edge_index[0]] # [num_edges, n_heads, out_features]
+        target_nodes_features = h_transformed[edge_index[1]] # [num_edges, n_heads, out_features]
+        
+        # 2. 計算注意力分數
+        attn_input = torch.cat([source_nodes_features, target_nodes_features], dim=-1) # [num_edges, n_heads, 2 * out_features]
+        e = self.leaky_relu((attn_input * self.a).sum(dim=-1)) # [num_edges, n_heads]
+
+        # 3. 使用 scatter_softmax 進行歸一化
+        # 我們希望對每個目標節點的所有入邊的注意力分數進行 softmax
+        attention = scatter_softmax(e, edge_index[1], dim=0) # [num_edges, n_heads]
+        attention = self.dropout(attention)
+
+        # 4. 聚合鄰居節點特徵
+        # 將注意力權重應用到源節點的特徵上
+        h_prime_scatter = source_nodes_features * attention.unsqueeze(-1) # [num_edges, n_heads, out_features]
+
+        # 使用 scatter_add 聚合加權後的特徵到目標節點
+        h_prime = scatter_add(h_prime_scatter, edge_index[1], dim=0, dim_size=h.size(0)) # [num_nodes, n_heads, out_features]
+
+        if self.concat:
+            # 拼接多個頭的輸出
+            return F.elu(h_prime.view(-1, self.n_heads * self.out_features))
+        else:
+            # 對多個頭的輸出取平均
+            return F.elu(h_prime.mean(dim=1))
+
+class GATStack(nn.Module):
+    """
+    多層 GAT 的堆疊。
+    """
+    def __init__(self, in_features, hidden_features, out_features, num_layers, n_heads):
+        super(GATStack, self).__init__()
+        self.layers = nn.ModuleList()
+        # 輸入層
+        self.layers.append(GATLayer(in_features, hidden_features, n_heads=n_heads, concat=True))
+        # 隱藏層
+        for _ in range(num_layers - 2):
+            self.layers.append(GATLayer(hidden_features * n_heads, hidden_features, n_heads=n_heads, concat=True))
+        # 輸出層
+        self.layers.append(GATLayer(hidden_features * n_heads, out_features, n_heads=1, concat=False))
+
+    def forward(self, h, edge_index):
+        for layer in self.layers:
+            h = layer(h, edge_index)
+        # GATStack 的輸出形狀是 [num_nodes, out_features]，我們需要返回一個元組以匹配 GINStack 的輸出簽名
+        # 在這個實現中，我們不返回節點索引，因為它們在 GraphModel 中處理
+        return h, None 
+
+
+
 class PathEncoder(nn.Module):
     """
     Generate path embedding given src node emb and (target + edge) embedding 
@@ -1176,34 +1260,35 @@ class GraphModel(nn.Module):
             self.p_ranker = TriAttnFlatPathRanker(hdim)
 
         self.k_hops = num_hops
-        self.path_per_batch_size = 512
+        self.path_per_batch_size = 128
         self.top_n = top_n
         self.cui_weights_dict = cui_weights_dict if cui_weights_dict else {}
         self.hdim = hdim # Store hdim for use
         
         self.gnn_update = gnn_update
         self.gnn_type = gnn_type
-        self.gin_num_layers = gin_num_layers if gin_num_layers else (3 if gnn_type == "Stack" else 1)
+        self.gin_num_layers = gin_num_layers if gin_num_layers else (2 if gnn_type == "Stack" else 1)
         self.gin_hidden_dim = gin_hidden_dim if gin_hidden_dim else hdim
         #self.input_edge_dim_for_gin = input_edge_dim_for_gin # Should match e_encoder output
+        self.gnn_update = gnn_update
         if self.gnn_update:
-            if self.gnn_type == "Stack":
-                self.gnn = GINStack(
-                    input_node_dim=hdim, 
-                    input_edge_dim=actual_edge_dim, 
-                    hidden_dim=self.gin_hidden_dim, 
-                    output_dim_final=hdim, 
-                    num_layers=self.gin_num_layers, 
-                    device=device
+            if gnn_type.upper() == "GAT":
+                print("Using GAT as the GNN backend.")
+                # 假設 GAT 的輸入維度是 hdim
+                # n_heads 可以作為一個新的超參數
+                self.gnn = GATStack(
+                    in_features=hdim, 
+                    hidden_features=gin_hidden_dim // nums_of_head, # 確保能整除
+                    out_features=hdim,
+                    num_layers=gin_num_layers,
+                    n_heads=nums_of_head
                 )
-            else:
-                self.gnn = NodeAggregateGIN(
-                    input_node_dim=hdim, 
-                    input_edge_dim=actual_edge_dim, 
-                    hidden_dim=self.gin_hidden_dim, 
-                    output_dim=hdim, 
-                    device=device
-                )
+            elif gnn_type.upper() == "STACK": # GINStack
+                print("Using GINStack as the GNN backend.")
+                self.gnn = GINStack(...)
+            else: # 默認或單層GIN
+                print("Using single layer NodeAggregateGIN as the GNN backend.")
+                self.gnn = NodeAggregateGIN(...)
         else:
             self.gnn = None
         
@@ -1296,7 +1381,7 @@ class GraphModel(nn.Module):
             
         # map_global_src_idx_to_local_in_unique = {glob_idx.item(): i for i, glob_idx in enumerate(unique_hop_src_indices)}
         # This scatter_index maps each path's global source CUI to its 0..N-1 index within unique_hop_src_indices
-        scatter_src_index_for_gin_agg = map_global_src_to_local_tensor[cand_src_idx_hop]
+        # scatter_src_index_for_gin_agg = map_global_src_to_local_tensor[cand_src_idx_hop]
 
         # Get edge embeddings for all paths
         # EdgeOneHot.Lookup expects list of labels, convert cand_edge_idx_hop back to labels
@@ -1325,45 +1410,87 @@ class GraphModel(nn.Module):
         # This part is complex to tensorize fully without specific GIN assumptions.
         # We need to aggregate target+edge features for each source in unique_hop_src_indices.
         if self.gnn_update and self.gnn:
-
-            # map_global_tgt_to_local_tensor 應該已經在前面根據 unique_hop_tgt_indices 創建好了
-            # unique_tgt_embs 也已經準備好
-
-            local_indices_for_gin_targets = map_global_tgt_to_local_tensor[cand_tgt_idx_hop]
             
-            # 錯誤處理：檢查是否有 -1 索引
-            if torch.any(local_indices_for_gin_targets == -1):
-                print(f"警告 (gin_path_tgt_node_features): cand_tgt_idx_hop 中存在未映射到 unique_hop_tgt_indices 的索引。")
-                # 根據您的策略處理錯誤，例如，如果決定過濾：
-                # valid_mask = (local_indices_for_gin_targets != -1)
-                # local_indices_for_gin_targets = local_indices_for_gin_targets[valid_mask]
-                # # 其他與路徑對應的張量 (如 scatter_src_index_for_gin_agg, path_edge_embs_for_gin_and_path_enc)
-                # # 也需要用這個 valid_mask 或等效方式進行篩選，以保持一致性。
-                # # 這會使邏輯複雜化，所以更好的方式是確保 cand_tgt_idx_hop 中的所有索引都是有效的。
-                # 暫時假設所有索引都有效，或者在發現-1時拋出錯誤以便調試：
+            # --- 【修改】根據 GNN 類型準備不同的輸入並調用 ---
+            if self.gnn_type.upper() == "GAT":
+                # GAT 需要一個包含所有參與計算節點的特徵矩陣，以及一個描述連接關係的 edge_index。
+                
+                # 1. 準備 GAT 的節點特徵輸入 (h)
+                # 合併當前跳所有涉及的源節點和目標節點，並去重
+                all_involved_unique_indices, inverse_map = torch.unique(
+                    torch.cat([unique_hop_src_indices, unique_hop_tgt_indices]), return_inverse=True
+                )
+                # 獲取這些唯一節點的嵌入
+                all_involved_embs = self._get_embeddings_by_indices(all_involved_unique_indices)
+
+                # 2. 準備 GAT 的邊索引輸入 (edge_index)
+                # 創建從全局CUI索引到GAT局部索引（0 到 N-1）的映射
+                map_global_to_gat_local = torch.full((self.g_tensorized['num_nodes'],), -1, dtype=torch.long, device=self.device)
+                map_global_to_gat_local[all_involved_unique_indices] = torch.arange(all_involved_unique_indices.size(0), device=self.device)
+
+                # 使用映射將全局邊索引轉換為局部邊索引
+                gat_edge_index_src = map_global_to_gat_local[cand_src_idx_hop]
+                gat_edge_index_tgt = map_global_to_gat_local[cand_tgt_idx_hop]
+                
+                # 過濾掉無效的邊（如果某個節點因為某些原因沒有被包含在 all_involved_unique_indices 中）
+                valid_edge_mask = (gat_edge_index_src != -1) & (gat_edge_index_tgt != -1)
+                gat_edge_index = torch.stack([
+                    gat_edge_index_src[valid_edge_mask], 
+                    gat_edge_index_tgt[valid_edge_mask]
+                ], dim=0)
+                
+                # 3. 調用 GAT
+                if all_involved_embs.numel() > 0 and gat_edge_index.numel() > 0:
+                    # GAT 會更新所有參與節點的嵌入
+                    updated_all_involved_embs, _ = self.gnn(all_involved_embs, gat_edge_index)
+                    
+                    # 4. 從更新後的嵌入中，取出我們需要的源節點嵌入
+                    local_indices_for_final_srcs = map_global_to_gat_local[unique_hop_src_indices]
+                    
+                    # 再次檢查，確保所有源節點都有有效的局部索引
+                    if torch.any(local_indices_for_final_srcs == -1):
+                        raise ValueError("GAT 更新後，部分源節點無法找到其對應的局部索引。")
+
+                    current_path_src_embs_for_encoding = updated_all_involved_embs[local_indices_for_final_srcs]
+                else:
+                    # 如果沒有有效的節點或邊來運行GAT，則不更新
+                    print(f"警告 (GAT): 在 hop {running_k_hop}，沒有有效的節點或邊來運行GAT，將跳過GNN更新。")
+
+            else: # GIN 的邏輯
+                # GIN 需要的是源節點特徵，以及一個將所有路徑信息聚合回源節點的 scatter_index。
+                
+                # 1. 準備 GIN 的 scatter_index
+                scatter_src_index_for_gin_agg = map_global_src_to_local_tensor[cand_src_idx_hop]
+                if torch.any(scatter_src_index_for_gin_agg == -1):
+                    raise ValueError("GIN 輸入準備錯誤：cand_src_idx_hop 中存在無法映射到局部索引的節點。")
+
+                # 2. 準備 GIN 的鄰居特徵 (目標節點)
+                local_indices_for_gin_targets = map_global_tgt_to_local_tensor[cand_tgt_idx_hop]
                 if torch.any(local_indices_for_gin_targets == -1):
-                     raise ValueError("gin_path_tgt_node_features: 發現無效的-1索引，這表示 cand_tgt_idx_hop 與 unique_hop_tgt_indices 不一致。")
-
-            # 確保 unique_tgt_embs 非空且索引有效
-            if unique_tgt_embs.numel() > 0:
-                gin_path_tgt_node_features = unique_tgt_embs[local_indices_for_gin_targets]
-            elif cand_tgt_idx_hop.numel() > 0: # 有目標索引，但 unique_tgt_embs 為空 (不應發生)
-                print(f"警告: unique_tgt_embs 為空，但 cand_tgt_idx_hop 並非如此。無法為 GNN 獲取有效的 gin_path_tgt_node_features。")
+                    raise ValueError("GIN 輸入準備錯誤：cand_tgt_idx_hop 中存在無法映射到局部索引的節點。")
+                
                 gin_path_tgt_node_features = torch.empty(0, self.hdim, device=self.device)
-            else: # cand_tgt_idx_hop 也為空
-                gin_path_tgt_node_features = torch.empty(0, self.hdim, device=self.device)
+                if unique_tgt_embs.numel() > 0:
+                    gin_path_tgt_node_features = unique_tgt_embs[local_indices_for_gin_targets]
 
-            updated_src_embs_from_gin, _ = self.gnn(
-                current_path_src_embs_for_encoding, # x_src_unique
-                unique_hop_src_indices,             # unique_src_to_process_indices (global IDs)
-                scatter_src_index_for_gin_agg,      # path_source_indices_global_scatter (local IDs for scatter)
-                gin_path_tgt_node_features,         # path_target_node_features
-                path_edge_embs_for_gin_and_path_enc # path_edge_features
-            )
-            current_path_src_embs_for_encoding = updated_src_embs_from_gin
-            # print(f"GIN updated src embs shape: {current_path_src_embs_for_encoding.shape}")
+                # 3. 確保所有輸入的維度一致
+                if gin_path_tgt_node_features.size(0) == path_edge_embs_for_gin_and_path_enc.size(0) and \
+                   scatter_src_index_for_gin_agg.size(0) == gin_path_tgt_node_features.size(0):
+                    
+                    # 4. 調用 GIN
+                    updated_src_embs_from_gin, _ = self.gnn(
+                        current_path_src_embs_for_encoding, 
+                        unique_hop_src_indices,            
+                        scatter_src_index_for_gin_agg,     
+                        gin_path_tgt_node_features,        
+                        path_edge_embs_for_gin_and_path_enc
+                    )
+                    current_path_src_embs_for_encoding = updated_src_embs_from_gin
+                else:
+                    # 如果輸入維度不匹配，跳過GNN更新以防出錯
+                    print(f"警告 (GIN): 在 hop {running_k_hop}，輸入維度不匹配，將跳過GNN更新。")
             
-        pruning_threshold_count = 512 # 您設定的篩選路徑數量上限
+        pruning_threshold_count = 128 # 您設定的篩選路徑數量上限
         num_paths_this_hop_before_pruning = num_paths_this_hop # ## NOW THIS IS VALID ##
 
         if num_paths_this_hop > pruning_threshold_count: # Check against initial num_paths_this_hop
@@ -1767,9 +1894,13 @@ class Trainer(nn.Module):
                  triplet_margin=1.0,
                  early_stopping_patience=3,
                  early_stopping_metric='val_loss',
-                 early_stopping_delta=0.001,
+                 early_stopping_delta=0.0001,
                  lambda_triplet=0.2,
-                 analyze_pruning=False
+                 analyze_pruning=False,
+                 scheduler_type='plateau', # 新增：調度器類型
+                 scheduler_patience=2,     # 新增：ReduceLROnPlateau 的 patience
+                 scheduler_factor=0.2,     # 新增：ReduceLROnPlateau 的 factor
+                 warmup_steps=500          # 新增：Warmup 的步數
                  ):
         super(Trainer, self).__init__()
 
@@ -1819,6 +1950,7 @@ class Trainer(nn.Module):
         self.LR = LR
         self.adam_epsilon = 1e-8
         self.weight_decay = 1e-4
+
         self.nums_of_epochs = nums_of_epochs
         self.intermediate = intermediate
         self.print_step = 50
@@ -1853,8 +1985,14 @@ class Trainer(nn.Module):
                       )
         logging.info(exp_setting)
         print(exp_setting)
-        self.optimizer = None
         
+        self.scheduler_type = scheduler_type
+        self.scheduler_patience = scheduler_patience
+        self.scheduler_factor = scheduler_factor
+        self.warmup_steps = warmup_steps
+        
+        self.optimizer = None
+        self.scheduler = None # 新增 scheduler 屬性
         
         self.analyze_pruning = analyze_pruning
         if self.analyze_pruning:
@@ -1886,6 +2024,7 @@ class Trainer(nn.Module):
         print(f"Using Learning Rate: {main_lr}")
         self.optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=main_lr, eps=self.adam_epsilon)
         print("Optimizer created.")
+        
 
 
     def compute_context_embedding(self, known_cuis_str_list_sample):
@@ -1946,21 +2085,27 @@ class Trainer(nn.Module):
         else:
             gt_target_embs = self.gmodel._get_embeddings_by_indices(gt_indices_tensor)
 
-        # 2. 計算每個預測目標與所有GT目標之間的餘弦相似度
-        # 歸一化嵌入以計算餘弦相似度
-        predicted_target_embs_norm = F.normalize(predicted_target_embs, p=2, dim=1)
-        gt_target_embs_norm = F.normalize(gt_target_embs, p=2, dim=1)
-        
-        # 相似度矩陣 [預測數, GT數]
-        similarity_matrix = torch.matmul(predicted_target_embs_norm, gt_target_embs_norm.t())
+            # 2. 計算每個預測目標與所有GT目標之間的餘弦相似度
+            # 歸一化嵌入以計算餘弦相似度
+            predicted_target_embs_norm = F.normalize(predicted_target_embs, p=2, dim=1)
+            gt_target_embs_norm = F.normalize(gt_target_embs, p=2, dim=1)
+            
+            # 相似度矩陣 [預測數, GT數]
+            similarity_matrix = torch.matmul(predicted_target_embs_norm, gt_target_embs_norm.t())
 
-        # 3. 為每個預測目標取其與所有GT中的最大相似度作為軟標籤
-        # soft_labels 的形狀為 [預測數]
-        soft_labels, _ = torch.max(similarity_matrix, dim=1)
-        
-        # 確保相似度不會是負數 (雖然餘弦相似度可能為負)
-        # 對於損失函數，通常希望標籤在 [0,1] 區間，可以選擇使用 clamp 或 relu
-        soft_labels = F.relu(soft_labels) 
+            # 3. 為每個預測目標取其與所有GT中的最大相似度作為軟標籤
+            # soft_labels 的形狀為 [預測數]
+            max_similarity_scores, _ = torch.max(similarity_matrix, dim=1)
+            soft_label_threshold = 0.7
+            soft_labels = torch.where(
+                max_similarity_scores > soft_label_threshold, 
+                max_similarity_scores, 
+                torch.zeros_like(max_similarity_scores)
+            )
+            
+            # 確保相似度不會是負數 (雖然餘弦相似度可能為負)
+            # 對於損失函數，通常希望標籤在 [0,1] 區間，可以選擇使用 clamp 或 relu
+            soft_labels = F.relu(soft_labels) 
 
         # 使用 torch_scatter (如果可用) 或 fallback 進行聚合
         if TORCH_SCATTER_AVAILABLE: # TORCH_SCATTER_AVAILABLE 應在類或全局定義
@@ -2352,7 +2497,28 @@ class Trainer(nn.Module):
 
     def train(self, train_data_loader, dev_data_loader, lr_scheduler=None):
         if self.optimizer is None: self.create_optimizers()
-        update_step = 4 
+        update_step = 8 
+        
+        if self.scheduler_type == 'plateau':
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min' if self.early_stopping_metric == 'val_loss' else 'max',
+                factor=self.scheduler_factor,
+                patience=self.scheduler_patience,
+                verbose=True
+            )
+            print(f"ReduceLROnPlateau scheduler created: mode='{'min' if self.early_stopping_metric == 'val_loss' else 'max'}', patience={self.scheduler_patience}, factor={self.scheduler_factor}.")
+        elif self.scheduler_type == 'warmup':
+            num_training_steps = len(train_data_loader) * self.nums_of_epochs
+            self.scheduler = get_linear_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=self.warmup_steps,
+                num_training_steps=num_training_steps
+            )
+            print(f"Linear scheduler with warmup created: warmup_steps={self.warmup_steps}, total_steps={num_training_steps}.")
+        else:
+            print("No learning rate scheduler will be used.")
+            self.scheduler = None
 
         for ep in range(self.nums_of_epochs):
             print(f"\n--- Starting Epoch {ep+1}/{self.nums_of_epochs} ---")
@@ -2409,8 +2575,13 @@ class Trainer(nn.Module):
                 batch_idx_in_epoch +=1
 
             if batch_idx_in_epoch % update_step != 0 and accumulated_loss_for_step.item() > 0 :
-                 torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0); torch.nn.utils.clip_grad_norm_(self.gmodel.parameters(), 1.0)
-                 self.optimizer.step(); self.optimizer.zero_grad()
+                 torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0)
+                 torch.nn.utils.clip_grad_norm_(self.gmodel.parameters(), 1.0)
+                 self.optimizer.step(); 
+                 if self.scheduler and self.scheduler_type == 'warmup':
+                    self.scheduler.step()
+                 self.optimizer.zero_grad()
+                 
 
             avg_ep_train_loss = np.mean(epoch_loss_train_list) if epoch_loss_train_list else float('nan')
             avg_ep_f1_1_train = np.mean(epoch_f1_1_train) if epoch_f1_1_train else float('nan')
@@ -2421,6 +2592,11 @@ class Trainer(nn.Module):
             avg_ep_p_final_dev, avg_ep_r_final_dev, avg_ep_f1_final_dev = self.validate(dev_data_loader)
             print(f"Epoch {ep+1} Valid Avg: Loss={avg_ep_dev_loss:.4f}, P@1={avg_ep_p1_dev:.4f}, R@1={avg_ep_r1_dev:.4f}, F1@1={avg_ep_f1_1_dev:.4f} | P@Final={avg_ep_p_final_dev:.4f}, R@Final={avg_ep_r_final_dev:.4f}, F1@Final={avg_ep_f1_final_dev:.4f}")
 
+            if self.scheduler and self.scheduler_type == 'plateau':
+                # ReduceLROnPlateau 需要一個監控指標來決定是否降低學習率
+                metric_for_scheduler = avg_ep_dev_loss if self.early_stopping_metric == 'val_loss' else avg_ep_f1_final_dev
+                self.scheduler.step(metric_for_scheduler)
+            
             if lr_scheduler: lr_scheduler.step()
 
             # ## MODIFIED: Early Stopping and Model Saving based on a primary metric, e.g., F1@Final
@@ -2582,10 +2758,10 @@ if __name__ =='__main__':
     nums_of_head = 3 
     top_n = 8 
     epochs = 100 
-    LR = 1e-5 
+    LR = 1e-5
     intermediate_loss_flag = True 
-    contrastive_flag = False 
-    batch_size = 4 
+    contrastive_flag = False
+    batch_size = 2 
     
     gin_hidden_dim_val = hdim 
     gin_num_layers_val = 2  
@@ -2614,21 +2790,22 @@ if __name__ =='__main__':
         nums_of_epochs=epochs, 
         LR=LR,
         loss_type="FOCAL",
-        focal_alpha=0.25,
-        focal_gamma=2.0,
+        focal_alpha=0.9,
+        focal_gamma=3.0,
         cui_weights_dict=None, 
         contrastive_learning=contrastive_flag,
         intermediate=intermediate_loss_flag,
-        score_threshold=0.8,
+        score_threshold=0.7,
         save_model_path=model_save_path,
         gnn_update=True, 
         path_encoder_type="Transformer",
         path_ranker_type="Flat",
-        gnn_type="Stack", 
+        gnn_type="GAT", 
         gin_hidden_dim=gin_hidden_dim_val,
         gin_num_layers=gin_num_layers_val,
-        early_stopping_patience=3,
+        early_stopping_patience=5,
         early_stopping_metric='val_loss',
+        early_stopping_delta=0.001,
         lambda_triplet=0.01,
         analyze_pruning=False
     )
