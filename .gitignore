@@ -1,4 +1,7 @@
 MediQ/
-MDDial/
+Evaluate/
 drknows/
 saved_models_mediq/
+benchmark/
+bm25_weights/
+test/

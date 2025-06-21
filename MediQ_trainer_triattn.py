@@ -21,7 +21,6 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import pickle
 import networkx as nx
-#from mpi4py import MPI
 from collections import OrderedDict, defaultdict
 
 
@@ -69,10 +68,7 @@ class MediQAnnotatedDataset(Dataset):
         num_cases_after_min_facts_filter = 0
 
         for case_id, data in all_annotations.items():
-            
-            if case_id == "1000":
-                break
-            
+          
             atomic_facts = data.get("atomic_facts", [])
             facts_cuis = data.get("facts_cuis", [])
             paths_between_facts = data.get("paths_between_facts", {})
@@ -256,6 +252,7 @@ class MediQPreprocessedDataset(Dataset):
                                                     在這個實現中，我們假設預處理時已經padding。
         """
         print(f"開始從預處理文件載入數據: {preprocessed_file_path}")
+        self.preprocessed_file_path = preprocessed_file_path
         self.samples = []
         try:
             with open(preprocessed_file_path, 'r', encoding='utf-8') as f:
@@ -742,6 +739,54 @@ class CuiEmbedding(object):
                  self.data[cui] = emb_tensor.to(self.device)
 
         return self
+    
+class EdgeEmbeddingLookup(object):
+    """
+    從 pickle 文件加載預先計算好的關係嵌入，並將其構建成一個全局嵌入矩陣，
+    以便進行高效的、基於索引的張量查找。
+    """
+    def __init__(self, embedding_file_path, edge_to_idx, device=torch.device('cpu')):
+        print(f"Loading and building relation embedding matrix from: {embedding_file_path}")
+        
+        # 加載原始的 "名稱->嵌入" 字典
+        try:
+            with open(embedding_file_path, 'rb') as f:
+                raw_data = pickle.load(f)
+        except Exception as e:
+            print(f"ERROR: Failed to load relation embedding file at {embedding_file_path}. Error: {e}")
+            raise
+            
+        self.device = device
+        self.embedding_dim = next(iter(raw_data.values())).shape[-1] if raw_data else 768
+
+        # 創建一個空的全局嵌入矩陣
+        num_relations = len(edge_to_idx)
+        self.global_relation_embedding_matrix = torch.zeros(num_relations, self.embedding_dim, device=self.device)
+
+        # 根據 edge_to_idx 的順序，填充這個矩陣
+        for name, index in edge_to_idx.items():
+            embedding_vector = raw_data.get(name)
+            if embedding_vector is not None:
+                self.global_relation_embedding_matrix[index] = torch.from_numpy(embedding_vector).float().to(self.device)
+            else:
+                print(f"Warning: Relation '{name}' found in graph but not in embedding file. Using zero vector.")
+        
+        print(f"Global relation embedding matrix created with shape: {self.global_relation_embedding_matrix.shape}")
+
+    def lookup_by_index(self, edge_indices_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        根據整數索引張量，直接從全局矩陣中查找嵌入。這是一個高效的 GPU 操作。
+        """
+        # 直接使用 PyTorch 的索引功能，這會在 GPU 上並行完成
+        return self.global_relation_embedding_matrix[edge_indices_tensor]
+    
+    
+
+    def to(self, device):
+        self.device = device
+        for name, emb in self.data.items():
+            self.data[name] = emb.to(device)
+        return self
 
 
 class EdgeOneHot(object): # Using the dynamic one from user's code
@@ -917,86 +962,87 @@ class NodeAggregateGIN(nn.Module):
 
 class GATLayer(nn.Module):
     """
-    單層的圖注意力網路 (GAT) 實現。
+    能夠整合邊特徵的圖注意力網路層 (Relational GAT 的一種簡化實現)。
     """
-    def __init__(self, in_features, out_features, n_heads, concat=True, dropout=0.1, leaky_relu_negative_slope=0.2):
+    def __init__(self, node_in_features, edge_in_features, out_features, n_heads, concat=True, dropout=0.1, leaky_relu_negative_slope=0.2):
         super(GATLayer, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
         self.n_heads = n_heads
+        self.out_features = out_features
         self.concat = concat
 
-        # 為每個頭創建獨立的線性變換層和注意力機制參數
-        self.W = nn.Linear(in_features, n_heads * out_features, bias=False)
+        # 線性變換層
+        self.W_node = nn.Linear(node_in_features, n_heads * out_features, bias=False)
+        self.W_edge = nn.Linear(edge_in_features, n_heads * out_features, bias=False)
+        
+        # 注意力機制參數
         self.a = nn.Parameter(torch.Tensor(n_heads, 2 * out_features))
 
         self.leaky_relu = nn.LeakyReLU(leaky_relu_negative_slope)
         self.dropout = nn.Dropout(dropout)
-        self.softmax = nn.Softmax(dim=1) # 將在 scatter_softmax 中使用
+        self.softmax = nn.Softmax(dim=1)
 
-        nn.init.xavier_uniform_(self.W.weight, gain=1.414)
+        nn.init.xavier_uniform_(self.W_node.weight, gain=1.414)
+        nn.init.xavier_uniform_(self.W_edge.weight, gain=1.414)
         nn.init.xavier_uniform_(self.a.data, gain=1.414)
 
-    def forward(self, h, edge_index):
+    def forward(self, h_node, edge_index, h_edge):
         """
         Args:
-            h (Tensor): 節點特徵矩陣，形狀 [num_nodes, in_features]
-            edge_index (Tensor): 邊索引，形狀 [2, num_edges]
+            h_node (Tensor): 節點特徵矩陣 [num_nodes, node_in_features]
+            edge_index (Tensor): 邊索引 [2, num_edges]
+            h_edge (Tensor): 邊特徵矩陣 [num_edges, edge_in_features]
         """
         if not TORCH_SCATTER_AVAILABLE:
-            raise ImportError("GATLayer requires torch_scatter for efficient operation.")
+            raise ImportError("EdgeGATLayer requires torch_scatter for efficient operation.")
 
-        # 1. 對節點特徵進行線性變換
-        h_transformed = self.W(h) # [num_nodes, n_heads * out_features]
-        h_transformed = h_transformed.view(-1, self.n_heads, self.out_features) # [num_nodes, n_heads, out_features]
-        
-        source_nodes_features = h_transformed[edge_index[0]] # [num_edges, n_heads, out_features]
-        target_nodes_features = h_transformed[edge_index[1]] # [num_edges, n_heads, out_features]
-        
-        # 2. 計算注意力分數
-        attn_input = torch.cat([source_nodes_features, target_nodes_features], dim=-1) # [num_edges, n_heads, 2 * out_features]
+        # 1. 對節點和邊特徵進行線性變換
+        h_node_transformed = self.W_node(h_node).view(-1, self.n_heads, self.out_features)
+        h_edge_transformed = self.W_edge(h_edge).view(-1, self.n_heads, self.out_features)
+
+        source_nodes_features = h_node_transformed[edge_index[0]] # [num_edges, n_heads, out_features]
+        target_nodes_features = h_node_transformed[edge_index[1]] # [num_edges, n_heads, out_features]
+
+        # 2. 計算注意力分數（核心修改：將邊的資訊加入）
+        # 將源節點特徵與邊特徵相加，作為資訊傳遞的「內容」
+        message_content = source_nodes_features + h_edge_transformed
+        attn_input = torch.cat([message_content, target_nodes_features], dim=-1) # [num_edges, n_heads, 2 * out_features]
         e = self.leaky_relu((attn_input * self.a).sum(dim=-1)) # [num_edges, n_heads]
 
         # 3. 使用 scatter_softmax 進行歸一化
-        # 我們希望對每個目標節點的所有入邊的注意力分數進行 softmax
-        attention = scatter_softmax(e, edge_index[1], dim=0) # [num_edges, n_heads]
+        attention = scatter_softmax(e, edge_index[1], dim=0)
         attention = self.dropout(attention)
 
         # 4. 聚合鄰居節點特徵
-        # 將注意力權重應用到源節點的特徵上
-        h_prime_scatter = source_nodes_features * attention.unsqueeze(-1) # [num_edges, n_heads, out_features]
+        # 將注意力權重應用到我們構造的 message_content 上
+        h_prime_scatter = message_content * attention.unsqueeze(-1)
 
         # 使用 scatter_add 聚合加權後的特徵到目標節點
-        h_prime = scatter_add(h_prime_scatter, edge_index[1], dim=0, dim_size=h.size(0)) # [num_nodes, n_heads, out_features]
+        h_prime = scatter_add(h_prime_scatter, edge_index[1], dim=0, dim_size=h_node.size(0))
 
         if self.concat:
-            # 拼接多個頭的輸出
             return F.elu(h_prime.view(-1, self.n_heads * self.out_features))
         else:
-            # 對多個頭的輸出取平均
             return F.elu(h_prime.mean(dim=1))
 
+### 【修改點 2C】：創建對應的 EdgeGATStack
 class GATStack(nn.Module):
-    """
-    多層 GAT 的堆疊。
-    """
-    def __init__(self, in_features, hidden_features, out_features, num_layers, n_heads):
+    """多層 EdgeGAT 的堆疊。"""
+    def __init__(self, node_in_features, edge_in_features, hidden_features, out_features, num_layers, n_heads):
         super(GATStack, self).__init__()
         self.layers = nn.ModuleList()
         # 輸入層
-        self.layers.append(GATLayer(in_features, hidden_features, n_heads=n_heads, concat=True))
+        self.layers.append(GATLayer(node_in_features, edge_in_features, hidden_features, n_heads=n_heads, concat=True))
         # 隱藏層
         for _ in range(num_layers - 2):
-            self.layers.append(GATLayer(hidden_features * n_heads, hidden_features, n_heads=n_heads, concat=True))
+            self.layers.append(GATLayer(hidden_features * n_heads, edge_in_features, hidden_features, n_heads=n_heads, concat=True))
         # 輸出層
-        self.layers.append(GATLayer(hidden_features * n_heads, out_features, n_heads=1, concat=False))
+        self.layers.append(GATLayer(hidden_features * n_heads, edge_in_features, out_features, n_heads=1, concat=False))
 
-    def forward(self, h, edge_index):
+    def forward(self, h_node, edge_index, h_edge):
         for layer in self.layers:
-            h = layer(h, edge_index)
-        # GATStack 的輸出形狀是 [num_nodes, out_features]，我們需要返回一個元組以匹配 GINStack 的輸出簽名
-        # 在這個實現中，我們不返回節點索引，因為它們在 GraphModel 中處理
-        return h, None 
+            h_node = layer(h_node, edge_index, h_edge)
+        # 返回更新後的節點嵌入和一個佔位符 None 以匹配 GINStack 的輸出簽名
+        return h_node, None
 
 
 
@@ -1118,46 +1164,6 @@ class TriAttnCombPathRanker(nn.Module):
         return out 
 
 
-class PathRanker(nn.Module):
-    """
-    Input: task embedding, cui embedding, and path embedding 
-    Step 1: compute task relevancy and context relevancy 
-    Step 2: compute attention scores based on task rel and context rel
-    Module has been tested ok; Note that the return shape is B X 4*hdim 
-    """
-    def __init__(self, hdim, nums_of_head, attn_weight_mode="Linear", cui_flag=True):
-        super(PathRanker, self).__init__()
-        self.attention = nn.MultiheadAttention(4*hdim, nums_of_head)
-        self.cui_flag = cui_flag
-        self.attn_mode = attn_weight_mode
-        self.mid_layer = nn.Linear(4*hdim, hdim)
-        self.score = nn.Linear(hdim, 1)
-
-        nn.init.xavier_uniform_(self.mid_layer.weight)
-        nn.init.xavier_uniform_(self.score.weight)
-
-
-    def forward(self, task_inputs, cui_inputs, path_embeddings):
-        # Infersent based Task relevancy: input text (premise) and paths (hypothesis) 
-        task_rel = torch.cat((task_inputs, 
-                              path_embeddings, 
-                              torch.abs(task_inputs - path_embeddings),
-                          task_inputs * path_embeddings), 1)
-        if self.cui_flag: # if also computing cui relevancy 
-            cui_rel = torch.cat((cui_inputs, 
-                                 path_embeddings, 
-                                 torch.abs(cui_inputs - path_embeddings),
-                          cui_inputs * path_embeddings), 1)
-            #self.merge_repr = task_rel * cui_rel # Hadamard Product of the two matrices
-            merge_repr = task_rel * cui_rel 
-            attn_output, attn_output_weights = self.attention(merge_repr, merge_repr, merge_repr)
-            self.attn_output_weights = attn_output_weights
-        else:
-            attn_output, attn_output_weights = self.attention(task_rel, task_rel, task_rel)
-
-        scores = self.score(F.relu(self.mid_layer(attn_output)))
-
-        return scores, attn_output, attn_output_weights # attn_output: weighted attention scores, B X 3072 ; attention output weights on scores 
 
 # ====================== model  ===================
 
@@ -1165,6 +1171,7 @@ class GraphModel(nn.Module):
     def __init__(self,
                  g_nx, # NetworkX graph for preprocessing
                  cui_embedding_lookup, # CuiEmbedding object (lookup by CUI string)
+                 relation_embedding_filepath, 
                  hdim,
                  nums_of_head,
                  num_hops, # Max hops
@@ -1230,15 +1237,14 @@ class GraphModel(nn.Module):
         # 在使用時，可以用 self.global_cui_embedding_matrix_buffer 替代 self.global_cui_embedding_matrix
         # 或者在 __init__ 結束時 self.global_cui_embedding_matrix = self.global_cui_embedding_matrix_buffer
                 
-        
-        
-        
-        
-        # Edge encoder needs the tensorized graph's edge_to_idx for dynamic mapping
-        # Or, if EdgeOneHot is modified to take graph_nx and build its own mapping:
-        self.e_encoder = EdgeOneHot(graph=g_nx, device=self.device) # Assumes EdgeOneHot can handle NX graph
-        # self.edge_idx_map = self.g_tensorized['edge_to_idx'] # No longer needed if e_encoder handles it
-        actual_edge_dim = self.e_encoder.num_edge_types
+  
+        # self.e_encoder = EdgeOneHot(graph=g_nx, device=self.device) # Assumes EdgeOneHot can handle NX graph
+        self.e_encoder = EdgeEmbeddingLookup(
+            embedding_file_path=relation_embedding_filepath, # 或者從參數傳入
+            edge_to_idx=self.g_tensorized['edge_to_idx'],
+            device=self.device
+        )
+        actual_edge_dim = self.e_encoder.embedding_dim if hasattr(self.e_encoder, 'embedding_dim') and self.e_encoder.embedding_dim is not None else hdim
         
         self.p_encoder_type = path_encoder_type
         self.path_ranker_type = path_ranker_type
@@ -1260,7 +1266,7 @@ class GraphModel(nn.Module):
             self.p_ranker = TriAttnFlatPathRanker(hdim)
 
         self.k_hops = num_hops
-        self.path_per_batch_size = 128
+        self.path_per_batch_size = 64
         self.top_n = top_n
         self.cui_weights_dict = cui_weights_dict if cui_weights_dict else {}
         self.hdim = hdim # Store hdim for use
@@ -1277,21 +1283,37 @@ class GraphModel(nn.Module):
                 # 假設 GAT 的輸入維度是 hdim
                 # n_heads 可以作為一個新的超參數
                 self.gnn = GATStack(
-                    in_features=hdim, 
-                    hidden_features=gin_hidden_dim // nums_of_head, # 確保能整除
+                    node_in_features=hdim, 
+                    edge_in_features=actual_edge_dim, # 使用 SapBERT 邊嵌入維度
+                    hidden_features=gin_hidden_dim // nums_of_head,
                     out_features=hdim,
                     num_layers=gin_num_layers,
                     n_heads=nums_of_head
                 )
             elif gnn_type.upper() == "STACK": # GINStack
                 print("Using GINStack as the GNN backend.")
-                self.gnn = GINStack(...)
+                self.gnn = GINStack(
+                    input_node_dim=hdim, 
+                    input_edge_dim=actual_edge_dim, 
+                    hidden_dim=self.gin_hidden_dim, 
+                    output_dim_final=hdim, 
+                    num_layers=self.gin_num_layers, 
+                    device=device
+                )
             else: # 默認或單層GIN
                 print("Using single layer NodeAggregateGIN as the GNN backend.")
-                self.gnn = NodeAggregateGIN(...)
+                self.gnn = NodeAggregateGIN(
+                    input_node_dim=hdim, 
+                    input_edge_dim=actual_edge_dim, 
+                    hidden_dim=self.gin_hidden_dim, 
+                    output_dim=hdim, 
+                    device=device
+                )
         else:
+            print("GNN update is disabled.")
             self.gnn = None
-        
+            
+
         
 
     def _get_embeddings_by_indices(self, cui_indices_tensor):
@@ -1388,22 +1410,11 @@ class GraphModel(nn.Module):
         # --- 在 cand_edge_idx_hop 被定義之後 ---
         # 現在 EdgeOneHot.Lookup 直接接收索引張量
         # cand_edge_idx_hop 本身就是邊類型的索引 (0 到 num_edge_types-1)
-        if cand_edge_idx_hop.numel() > 0: # 僅當有邊時才查找
-            path_edge_embs_for_gin_and_path_enc = self.e_encoder.Lookup(cand_edge_idx_hop)
-            # .to(self.device) 通常由 self.e_encoder.onehot_mat 初始化時或 Lookup 內部保證
-        else: # 如果沒有邊索引 (例如，沒有路徑被找到)
-            # actual_edge_dim 應在 __init__ 中從 self.e_encoder.num_edge_types 獲取
-            actual_edge_dim = self.e_encoder.num_edge_types if self.e_encoder.num_edge_types > 0 else 0
-            path_edge_embs_for_gin_and_path_enc = torch.empty(0, actual_edge_dim, device=self.device)
-
-
-        current_path_src_embs_for_encoding = unique_src_embs_base.clone()
-        if running_k_hop == 0 and self.cui_weights_dict:
-            weights = torch.tensor(
-                [self.cui_weights_dict.get(self.g_tensorized['idx_to_cui'].get(idx.item()), 1.0)
-                 for idx in unique_hop_src_indices], device=self.device
-            ).unsqueeze(1)
-            current_path_src_embs_for_encoding = current_path_src_embs_for_encoding * weights
+        if cand_edge_idx_hop.numel() > 0:
+            
+            path_edge_embs_for_gin_and_path_enc = self.e_encoder.lookup_by_index(cand_edge_idx_hop)
+        else: 
+            print("error no edge exists")
         
         
         # --- 3. Optional GNN Update on current_path_src_embs ---
@@ -1439,10 +1450,12 @@ class GraphModel(nn.Module):
                     gat_edge_index_tgt[valid_edge_mask]
                 ], dim=0)
                 
+                gat_edge_features = path_edge_embs_for_gin_and_path_enc[valid_edge_mask]
+                
                 # 3. 調用 GAT
                 if all_involved_embs.numel() > 0 and gat_edge_index.numel() > 0:
                     # GAT 會更新所有參與節點的嵌入
-                    updated_all_involved_embs, _ = self.gnn(all_involved_embs, gat_edge_index)
+                    updated_all_involved_embs, _ = self.gnn(all_involved_embs, gat_edge_index, gat_edge_features)
                     
                     # 4. 從更新後的嵌入中，取出我們需要的源節點嵌入
                     local_indices_for_final_srcs = map_global_to_gat_local[unique_hop_src_indices]
@@ -1490,7 +1503,7 @@ class GraphModel(nn.Module):
                     # 如果輸入維度不匹配，跳過GNN更新以防出錯
                     print(f"警告 (GIN): 在 hop {running_k_hop}，輸入維度不匹配，將跳過GNN更新。")
             
-        pruning_threshold_count = 128 # 您設定的篩選路徑數量上限
+        pruning_threshold_count = 64 # 您設定的篩選路徑數量上限
         num_paths_this_hop_before_pruning = num_paths_this_hop # ## NOW THIS IS VALID ##
 
         if num_paths_this_hop > pruning_threshold_count: # Check against initial num_paths_this_hop
@@ -1498,6 +1511,8 @@ class GraphModel(nn.Module):
 
             if unique_tgt_embs.numel() > 0 : # 確保 unique_tgt_embs 不是空的
                 if gt_indices_for_pruning is not None and gt_indices_for_pruning.numel() > 0:
+                    
+                    
                     # 1. 識別並分離出 GT 路徑
                     is_gt_mask = torch.isin(cand_tgt_idx_hop, gt_indices_for_pruning)
                     gt_path_indices = torch.where(is_gt_mask)[0]
@@ -1704,14 +1719,15 @@ class GraphModel(nn.Module):
 
                 batch_projected_first_rel_embs = None
                 if running_k_hop == 1 and batch_mem_first_edge_idx is not None and self.edge_to_node_projection_for_transformer is not None:
-                    valid_first_edge_mask = (batch_mem_first_edge_idx != -1) & (batch_mem_first_edge_idx < self.e_encoder.onehot_mat.shape[0])
+                    valid_first_edge_mask = (batch_mem_first_edge_idx != -1) 
                     if torch.any(valid_first_edge_mask):
                         batch_projected_first_rel_embs = torch.zeros(batch_mem_first_edge_idx.size(0), self.hdim, device=self.device)
-                        
+                       
                         first_rel_indices_to_lookup = batch_mem_first_edge_idx[valid_first_edge_mask]
-                        if first_rel_indices_to_lookup.numel() > 0 and self.e_encoder.onehot_mat.numel() > 0 : # 確保 onehot_mat 非空
-                            first_rel_one_hots = self.e_encoder.onehot_mat[first_rel_indices_to_lookup] # .to(self.device) 已在 onehot_mat 初始化時處理
-                            batch_projected_first_rel_embs[valid_first_edge_mask] = self.edge_to_node_projection_for_transformer(first_rel_one_hots)
+                        
+                        if first_rel_indices_to_lookup.numel() > 0:
+                            first_rel_sapbert_embs = self.e_encoder.lookup_by_index(first_rel_indices_to_lookup)                   
+                            batch_projected_first_rel_embs[valid_first_edge_mask] = self.edge_to_node_projection_for_transformer(first_rel_sapbert_embs)
                 
                 # --- 2. Python 迴圈逐條構建序列 (內部操作現在是從預提取的批次嵌入中索引) ---
                 src_sequences_for_transformer = []
@@ -1868,7 +1884,8 @@ class Trainer(nn.Module):
     def __init__(self, tokenizer,
                  encoder, 
                  g_nx, 
-                 cui_embedding_lookup, 
+                 cui_embedding_lookup,
+                 relation_embedding_filepath,
                  hdim,
                  nums_of_head, 
                  cui_vocab_str_to_idx, 
@@ -1885,8 +1902,12 @@ class Trainer(nn.Module):
                  gnn_update=True,
                  intermediate=False, 
                  score_threshold=0.5, # ## ADDED: 評分閾值
+                 finetune_encoder=True,          # 是否訓練 encoder
+                 use_soft_labels=True,           # 是否使用軟標籤
+                 soft_label_threshold=0.5,     # 軟標籤的閾值
+                 preserve_gt_in_pruning=False,  # 是否在剪枝時保留GT
                  distance_metric="Cosine",
-                 path_encoder_type="MLP",
+                 path_encoder_type="Transformer",
                  path_ranker_type="Flat",
                  gnn_type="Stack",
                  gin_hidden_dim=None,
@@ -1898,8 +1919,8 @@ class Trainer(nn.Module):
                  lambda_triplet=0.2,
                  analyze_pruning=False,
                  scheduler_type='plateau', # 新增：調度器類型
-                 scheduler_patience=2,     # 新增：ReduceLROnPlateau 的 patience
-                 scheduler_factor=0.2,     # 新增：ReduceLROnPlateau 的 factor
+                 scheduler_patience=3,     # 新增：ReduceLROnPlateau 的 patience
+                 scheduler_factor=0.8,     # 新增：ReduceLROnPlateau 的 factor
                  warmup_steps=500          # 新增：Warmup 的步數
                  ):
         super(Trainer, self).__init__()
@@ -1911,9 +1932,17 @@ class Trainer(nn.Module):
         self.cui_vocab_str_to_idx = cui_vocab_str_to_idx 
         self.rev_cui_vocab_idx_to_str = {v: k for k, v in cui_vocab_str_to_idx.items()}
         self.top_n_for_exploration = top_n # ## RENAMED for clarity
+        self.finetune_encoder = finetune_encoder
+        self.use_soft_labels = use_soft_labels
+        self.soft_label_threshold = soft_label_threshold
+        self.preserve_gt_in_pruning = preserve_gt_in_pruning
         
-        
-        
+        if not self.finetune_encoder:
+            print("Encoder parameters are FROZEN.")
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+        else:
+            print("Encoder parameters will be fine-tuned.")
         
         self.loss_type = loss_type
         if self.loss_type.upper() == 'FOCAL':
@@ -1930,6 +1959,7 @@ class Trainer(nn.Module):
         self.gmodel = GraphModel(
             g_nx=g_nx, 
             cui_embedding_lookup=cui_embedding_lookup,
+            relation_embedding_filepath=relation_embedding_filepath,
             hdim=hdim,
             nums_of_head=nums_of_head,
             num_hops=self.k_hops, # GraphModel 內部可能不需要這個num_hops了，因為Trainer控制跳數
@@ -1949,7 +1979,7 @@ class Trainer(nn.Module):
 
         self.LR = LR
         self.adam_epsilon = 1e-8
-        self.weight_decay = 1e-4
+        self.weight_decay = 1e-5
 
         self.nums_of_epochs = nums_of_epochs
         self.intermediate = intermediate
@@ -1999,6 +2029,10 @@ class Trainer(nn.Module):
                        f"PATH ENCODER TYPE: {path_encoder_type}\n"
                        f"PATH RANKER TYPE: {path_ranker_type}\n"
                        f"SCHEDULER TYPE: {scheduler_type}\n"
+                       f"Finetune Encoder: {self.finetune_encoder}\n"
+                       f"Use Softlabel: {self.use_soft_labels}\n"
+                       f"Softlabel Threshold: {self.soft_label_threshold}\n"
+                       f"Preserve GT Paths: {self.preserve_gt_in_pruning}\n"
                       )
         logging.info(exp_setting)
         print(exp_setting)
@@ -2010,21 +2044,28 @@ class Trainer(nn.Module):
         encoder_lr = 1e-6 # 假設
         weight_decay_val = self.weight_decay # 例如 0.01
         
+        gmodel_params_decay = [p for n, p in self.gmodel.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad]
+        gmodel_params_no_decay = [p for n, p in self.gmodel.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad]
+        
         optimizer_grouped_parameters = [
-            # --- gmodel 參數組 (使用主學習率) ---
-            {'params': [p for n, p in self.gmodel.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad], 
-            'weight_decay': weight_decay_val, 'lr': main_lr},
-            {'params': [p for n, p in self.gmodel.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad], 
-            'weight_decay': 0.0, 'lr': main_lr},
-            
-            # --- encoder (SapBERT) 參數組 (使用較小的學習率) ---
-            {'params': [p for n, p in self.encoder.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad], 
-            'weight_decay': weight_decay_val, 'lr': encoder_lr},
-            {'params': [p for n, p in self.encoder.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad], 
-            'weight_decay': 0.0, 'lr': encoder_lr}
+            {'params': gmodel_params_decay, 'weight_decay': self.weight_decay},
+            {'params': gmodel_params_no_decay, 'weight_decay': 0.0}
         ]
         
-        print(f"Using Learning Rate: {main_lr}")
+        if self.finetune_encoder:
+            print("Adding encoder parameters to the optimizer.")
+            encoder_params_decay = [p for n, p in self.encoder.named_parameters() if not any(nd in n for nd in no_decay) and p.requires_grad]
+            encoder_params_no_decay = [p for n, p in self.encoder.named_parameters() if any(nd in n for nd in no_decay) and p.requires_grad]
+            
+            optimizer_grouped_parameters.extend([
+                {'params': encoder_params_decay, 'weight_decay': self.weight_decay, 'lr': encoder_lr},
+                {'params': encoder_params_no_decay, 'weight_decay': 0.0, 'lr': encoder_lr}
+            ])
+        else:
+            print("Skipping encoder parameters in the optimizer.")
+            
+        
+        print(f"Using Main Learning Rate: {main_lr}", f" and Encoder Learning Rate: {encoder_lr}")
         self.optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=main_lr, eps=self.adam_epsilon)
         print("Optimizer created.")
         
@@ -2079,36 +2120,37 @@ class Trainer(nn.Module):
         if unique_path_targets_global_indices.numel() == 0:
             return hop_loss
         
-        # 1. 獲取預測目標和GT目標的嵌入向量
-        predicted_target_embs = self.gmodel._get_embeddings_by_indices(unique_path_targets_global_indices)
-    
-        gt_indices_tensor = self._get_gt_indices_tensor(gt_cuis_str_list_sample)
-        if not gt_indices_tensor.numel() > 0: # 如果沒有GT，所有標籤都為0
-            soft_labels = torch.zeros(predicted_target_embs.size(0), device=self.device)
+        if self.use_soft_labels:
+            predicted_target_embs = self.gmodel._get_embeddings_by_indices(unique_path_targets_global_indices)
+            gt_indices_tensor = self._get_gt_indices_tensor(gt_cuis_str_list_sample)
+            if not gt_indices_tensor.numel() > 0:
+                # 如果沒有GT，所有標籤都為0
+                labels_for_loss = torch.zeros(predicted_target_embs.size(0), device=self.device)
+            else:
+                gt_target_embs = self.gmodel._get_embeddings_by_indices(gt_indices_tensor)
+
+                # 2. 計算餘弦相似度矩陣
+                predicted_target_embs_norm = F.normalize(predicted_target_embs, p=2, dim=1)
+                gt_target_embs_norm = F.normalize(gt_target_embs, p=2, dim=1)
+                similarity_matrix = torch.matmul(predicted_target_embs_norm, gt_target_embs_norm.t())
+
+                # 3. 為每個預測目標取其與所有GT中的最大相似度
+                max_similarity_scores, _ = torch.max(similarity_matrix, dim=1)
+                
+                # 4. 應用閾值，創建帶有"死區"的軟標籤
+                soft_labels = torch.where(
+                    max_similarity_scores > self.soft_label_threshold, 
+                    max_similarity_scores, 
+                    torch.zeros_like(max_similarity_scores)
+                )
+                labels_for_loss = soft_labels
         else:
-            gt_target_embs = self.gmodel._get_embeddings_by_indices(gt_indices_tensor)
-
-            # 2. 計算每個預測目標與所有GT目標之間的餘弦相似度
-            # 歸一化嵌入以計算餘弦相似度
-            predicted_target_embs_norm = F.normalize(predicted_target_embs, p=2, dim=1)
-            gt_target_embs_norm = F.normalize(gt_target_embs, p=2, dim=1)
-            
-            # 相似度矩陣 [預測數, GT數]
-            similarity_matrix = torch.matmul(predicted_target_embs_norm, gt_target_embs_norm.t())
-
-            # 3. 為每個預測目標取其與所有GT中的最大相似度作為軟標籤
-            # soft_labels 的形狀為 [預測數]
-            max_similarity_scores, _ = torch.max(similarity_matrix, dim=1)
-            soft_label_threshold = 0.7
-            soft_labels = torch.where(
-                max_similarity_scores > soft_label_threshold, 
-                max_similarity_scores, 
-                torch.zeros_like(max_similarity_scores)
-            )
-            
-            # 確保相似度不會是負數 (雖然餘弦相似度可能為負)
-            # 對於損失函數，通常希望標籤在 [0,1] 區間，可以選擇使用 clamp 或 relu
-            soft_labels = F.relu(soft_labels) 
+            gt_indices_tensor = self._get_gt_indices_tensor(gt_cuis_str_list_sample)
+            is_gt_mask = torch.isin(unique_path_targets_global_indices, gt_indices_tensor)
+            labels_for_loss = is_gt_mask.float()
+        
+        
+        
 
         # 使用 torch_scatter (如果可用) 或 fallback 進行聚合
         if TORCH_SCATTER_AVAILABLE: # TORCH_SCATTER_AVAILABLE 應在類或全局定義
@@ -2150,22 +2192,14 @@ class Trainer(nn.Module):
             if not temp_aggregated_scores_list: return hop_loss
             aggregated_scores_for_unique_targets = torch.stack(temp_aggregated_scores_list)
 
-        # 6. 為 unique_path_targets_global_indices 生成二元標籤 (0 或 1)
-        if not gt_indices_tensor.numel() > 0: 
-            # 如果沒有 GT，但有預測目標，則所有預測目標的標籤都應為0
-            labels_for_unique_targets = torch.zeros_like(aggregated_scores_for_unique_targets, dtype=torch.float, device=self.device)
-        else:
-            # ## MODIFIED: 使用 torch.isin() 向量化標籤生成
-            is_gt_mask = torch.isin(unique_path_targets_global_indices, gt_indices_tensor)
-            labels_for_unique_targets = is_gt_mask.float() # 將布林掩碼轉換為 0.0 或 1.0
+       
         
         # 7. 計算 BCE 損失
         # 確保 aggregated_scores 和 labels 的形狀和元素數量匹配
         if aggregated_scores_for_unique_targets.numel() > 0 and \
-           aggregated_scores_for_unique_targets.size(0) == soft_labels.size(0):
-             hop_loss = self.loss_fn_bce(aggregated_scores_for_unique_targets, soft_labels)
-        elif aggregated_scores_for_unique_targets.numel() > 0 : # Labels 數量不匹配 (不應發生)
-            print(f"警告 (BCE Loss): aggregated_scores ({aggregated_scores_for_unique_targets.size(0)}) 和 labels ({labels_for_unique_targets.size(0)}) 數量不匹配。")
+           aggregated_scores_for_unique_targets.size(0) == labels_for_loss.size(0):
+             hop_loss = self.loss_fn_bce(aggregated_scores_for_unique_targets, labels_for_loss)
+        
             
         return hop_loss
 
@@ -2252,12 +2286,7 @@ class Trainer(nn.Module):
         accumulated_batch_loss = torch.tensor(0.0, device=self.device)
         batch_size = input_task_embs_batch.shape[0]
         
-        # ## MODIFIED: 用於存儲最終預測結果 (包含完整路徑信息)
-        # 結構: batch_final_predictions[sample_idx] = { "path_tuple_str": "CUI_A->Rel1->CUI_B->Rel2->CUI_C", "final_target_cui": "CUI_C", "score": score, "hop": 2 }
-        # 或者更簡單: batch_final_predictions[sample_idx] = [{"target": CUI_str, "hop": N, "score": S, "full_path_indices": (orig_s, r1, inter_s, r2, final_t)}]
-        batch_final_predictions_for_acc = [[] for _ in range(batch_size)] 
-        # 用於評估1跳的準確性
-        batch_hop1_predictions_for_acc = [[] for _ in range(batch_size)] 
+        batch_detailed_predictions = [[] for _ in range(batch_size)]
 
         for i in range(batch_size): # Sample 迴圈
             sample_loss_this_item = torch.tensor(0.0, device=self.device)
@@ -2268,10 +2297,6 @@ class Trainer(nn.Module):
 
             current_cui_str_list_for_hop = known_cuis_str_sample
             prev_iter_state_for_next_hop = None
-            
-    
-            
-            # 最終預測集合，key: (orig_src_idx, first_hop_target_idx), value: {"path": path_tuple, "score": score, "hop": 1 or 2}
             current_sample_final_preds_dict = {}
 
 
@@ -2286,24 +2311,22 @@ class Trainer(nn.Module):
                 elif running_k == 1:
                     gt_cuis_str_list_this_hop.extend(hop2_target_cuis_str_batch[i])
                           
-                gt_indices_tensor_for_pruning = self._get_gt_indices_tensor(list(set(gt_cuis_str_list_this_hop)))
+                          
+                if self.preserve_gt_in_pruning:
+                    gt_indices_tensor_for_pruning = self._get_gt_indices_tensor(list(set(gt_cuis_str_list_this_hop)))
+                else:
+                    gt_indices_tensor_for_pruning = None
+                               
                 all_paths_info_hop, _, \
                 next_hop_state_info_for_exploration, stop_flag, debug_info = self.gmodel.one_iteration(
                     task_emb_sample, current_cui_str_list_for_hop, running_k,
                     context_emb_sample, prev_iter_state_for_next_hop,
-                    gt_indices_for_pruning=gt_indices_tensor_for_pruning if self.training else None
+                    gt_indices_for_pruning=gt_indices_tensor_for_pruning 
                 )
 
                 if stop_flag or all_paths_info_hop is None: break
 
-                # --- 損失計算 (GT選取邏輯已更新) ---
-                gt_cuis_str_list_this_hop = []
-                if running_k == 0:
-                    gt_cuis_str_list_this_hop.extend(hop1_target_cuis_str_batch[i])
-                    if self.intermediate:
-                        gt_cuis_str_list_this_hop.extend(intermediate_target_cuis_batch[i])
-                elif running_k == 1:
-                    gt_cuis_str_list_this_hop.extend(hop2_target_cuis_str_batch[i])
+               
                     
                 gt_indices_tensor_for_analysis = self._get_gt_indices_tensor(list(set(gt_cuis_str_list_this_hop)))
                 gt_cuis_str_list_this_hop = list(set(gt_cuis_str_list_this_hop))
@@ -2345,12 +2368,22 @@ class Trainer(nn.Module):
                             anchor_for_triplet, all_paths_info_hop, gt_cuis_str_list_this_hop
                         )
                 current_hop_total_loss = current_hop_bce_loss + self.lambda_triplet * current_hop_triplet_loss
-                sample_loss_this_item = sample_loss_this_item + current_hop_total_loss
+                
+                len_penalty = True
+                if len_penalty:
+                    if running_k == 0: # running_k=0 代表是第一跳 (1-hop)
+                        hop_weighted_loss = 1.0 * current_hop_total_loss
+                    elif running_k == 1: # running_k=1 代表是第二跳 (2-hop)
+                        hop_weighted_loss = 0.7 * current_hop_total_loss
+                else:
+                    hop_weighted_loss = current_hop_total_loss
+                
+                sample_loss_this_item = sample_loss_this_item + hop_weighted_loss
                 
                 # --- ## MODIFIED: 基於閾值篩選高質量預測，並執行路徑取代 ---
                 path_scores = all_paths_info_hop['scores'].squeeze(-1) # [num_paths]
-                confident_mask = (path_scores >= self.score_threshold)
-                
+                normalized_scores = torch.sigmoid(path_scores)
+                confident_mask = (normalized_scores >= self.score_threshold)               
                 confident_path_indices = torch.where(confident_mask)[0]
 
                 if confident_path_indices.numel() > 0:
@@ -2359,7 +2392,7 @@ class Trainer(nn.Module):
                     conf_hop_srcs = all_paths_info_hop['src_idx'][confident_path_indices] # 當前跳的源 (中間節點 for hop2)
                     conf_hop_edges = all_paths_info_hop['edge_idx'][confident_path_indices] # 當前跳的邊 (Rel2 for hop2)
                     conf_hop_tgts = all_paths_info_hop['tgt_idx'][confident_path_indices]   # 當前跳的目標 (最終目標 for hop2)
-                    conf_scores = path_scores[confident_path_indices]
+                    conf_scores = normalized_scores[confident_path_indices]
 
                     for k_path in range(confident_path_indices.numel()):
                         orig_s_idx = conf_orig_srcs[k_path].item()
@@ -2377,10 +2410,6 @@ class Trainer(nn.Module):
                             # 這裡 orig_s_idx == inter_s_idx， r1_idx == -1
                             full_path_tuple_for_pred = (orig_s_idx, r2_idx, final_t_idx)
 
-
-                            # 記錄用於1-hop accuracy計算的目標
-                            batch_hop1_predictions_for_acc[i].append(self.rev_cui_vocab_idx_to_str.get(final_t_idx))
-                            
                             if path_key not in current_sample_final_preds_dict or \
                                current_score > current_sample_final_preds_dict[path_key]['score']:
                                 current_sample_final_preds_dict[path_key] = {
@@ -2444,16 +2473,21 @@ class Trainer(nn.Module):
                     prev_iter_state_for_next_hop = next_hop_state_info_for_exploration 
                 else: 
                     break 
+                
+                
+            detailed_preds_for_sample = []
+            for pred_info in current_sample_final_preds_dict.values():
+                target_cui_str = self.rev_cui_vocab_idx_to_str.get(pred_info['final_target_idx'])
+                if target_cui_str:
+                    detailed_preds_for_sample.append({
+                        "target_cui": target_cui_str,
+                        "score": pred_info['score'],
+                        "hop": pred_info['hop'],
+                        "path_indices": pred_info['path_tuple_indices']
+                    })
+            batch_detailed_predictions[i] = detailed_preds_for_sample
             
-            accumulated_batch_loss = accumulated_batch_loss + sample_loss_this_item
-            # 將 current_sample_final_preds_dict 中的 final_target_idx 收集起來用於 acc 計算
-            batch_final_predictions_for_acc[i] = [
-                self.rev_cui_vocab_idx_to_str.get(pred_info['final_target_idx'])
-                for pred_info in current_sample_final_preds_dict.values()
-                if self.rev_cui_vocab_idx_to_str.get(pred_info['final_target_idx']) is not None
-            ]
-            # 確保 batch_hop1_predictions_for_acc[i] 也是去重的字符串列表
-            batch_hop1_predictions_for_acc[i] = list(set(batch_hop1_predictions_for_acc[i]))
+            accumulated_batch_loss += sample_loss_this_item
 
 
         avg_batch_loss = accumulated_batch_loss / batch_size if batch_size > 0 else torch.tensor(0.0, device=self.device)
@@ -2461,42 +2495,90 @@ class Trainer(nn.Module):
         # final_predicted_cuis_str_batch 用於與 hop2_target_cuis 比較 (或者一個合併的GT)
         # batch_hop1_predictions_for_acc 用於與 hop1_target_cuis 比較
         # 這個返回值需要調整，以包含不同hop的預測
-        return avg_batch_loss, batch_final_predictions_for_acc, batch_hop1_predictions_for_acc
+        return avg_batch_loss, batch_detailed_predictions
 
 
-    def measure_accuracy(self, final_predicted_cuis_str_batch, target_cuis_str_batch, mode="Recall@N"):
-        # 這個函數需要被擴展或複製以處理不同 hop 的 accuracy
-        # 例如，可以有一個 measure_recall, measure_precision, measure_f1
-        # 這裡暫時保持原樣，但您可能需要為1-hop和最終結果分別調用它，或傳入mode
-        batch_size = len(target_cuis_str_batch)
-        if batch_size == 0: return 0.0, 0.0, 0.0 # P, R, F1
+    def measure_accuracy(self, batch_detailed_predictions, batch_gts):
+        """
+        接收詳細的預測結果和批次GT，計算1跳、2跳和最終預測的 Precision, Recall, F1。
         
-        all_precisions, all_recalls, all_f1s = [], [], []
+        Args:
+            batch_detailed_predictions (list[list[dict]]): forward_per_batch 返回的結構化預測。
+            batch_gts (dict): 來自 DataLoader 的原始批次數據，包含所有GT列表。
+        
+        Returns:
+            dict: 一個包含所有計算出的指標的字典。
+        """
+        batch_size = len(batch_detailed_predictions)
+        if batch_size == 0:
+            return {
+                'final': {'p': 0, 'r': 0, 'f1': 0},
+                'hop1': {'p': 0, 'r': 0, 'f1': 0},
+                'hop2': {'p': 0, 'r': 0, 'f1': 0},
+            }
 
+        # 準備用於聚合的列表
+        list_final_preds, list_hop1_preds, list_hop2_preds = [], [], []
+        list_final_gts, list_hop1_gts, list_hop2_gts = [], [], []
+
+        # 1. 遍歷批次中的每個樣本，拆分預測和GT
         for i in range(batch_size):
-            gold_cuis = set(target_cuis_str_batch[i])
-            # final_predicted_cuis_str_batch[i] 應該是去重後的字符串列表
-            pred_cuis = set(final_predicted_cuis_str_batch[i]) 
+            sample_detailed_preds = batch_detailed_predictions[i]
             
-            num_pred = len(pred_cuis)
-            num_gold = len(gold_cuis)
-            if num_gold == 0: continue
+            # --- 分離預測集 (基於 'hop' 標籤) ---
+            # 最終預測是所有跳數的並集
+            final_preds_for_sample = {p['target_cui'] for p in sample_detailed_preds}
+            # 存活下來的1跳預測
+            hop1_preds_for_sample = {p['target_cui'] for p in sample_detailed_preds if p['hop'] == 1}
+            # 2跳預測
+            hop2_preds_for_sample = {p['target_cui'] for p in sample_detailed_preds if p['hop'] == 2}
             
-            num_intersect = len(gold_cuis.intersection(pred_cuis))
+            list_final_preds.append(final_preds_for_sample)
+            list_hop1_preds.append(hop1_preds_for_sample)
+            list_hop2_preds.append(hop2_preds_for_sample)
 
-            precision = num_intersect / num_pred if num_pred > 0 else 0.0
-            recall = num_intersect / num_gold if num_gold > 0 else 0.0
-            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+            # --- 分離GT集 ---
+            hop1_gt_for_sample = set(batch_gts['hop1_target_cuis'][i])
+            hop2_gt_for_sample = set(batch_gts['hop2_target_cuis'][i])
+            combined_gt_for_sample = hop1_gt_for_sample.union(hop2_gt_for_sample)
+
+            list_final_gts.append(combined_gt_for_sample)
+            list_hop1_gts.append(hop1_gt_for_sample)
+            list_hop2_gts.append(hop2_gt_for_sample)
+
+        # 2. 為每個類別計算指標
+        def _calculate_prf1(pred_sets, gold_sets):
+            all_p, all_r, all_f1 = [], [], []
+            for i in range(len(pred_sets)):
+                preds = pred_sets[i]
+                golds = gold_sets[i]
+                
+                num_pred = len(preds)
+                num_gold = len(golds)
+                if num_gold == 0: # 如果這個樣本沒有GT，則不參與該項指標計算
+                    continue 
+
+                num_intersect = len(golds.intersection(preds))
+                
+                p = num_intersect / num_pred if num_pred > 0 else 0.0
+                r = num_intersect / num_gold if num_gold > 0 else 0.0
+                f1 = 2 * (p * r) / (p + r) if (p + r) > 0 else 0.0
+                all_p.append(p); all_r.append(r); all_f1.append(f1)
             
-            all_precisions.append(precision)
-            all_recalls.append(recall)
-            all_f1s.append(f1)
-            
-        avg_precision = np.mean(all_precisions) if all_precisions else 0.0
-        avg_recall = np.mean(all_recalls) if all_recalls else 0.0
-        avg_f1 = np.mean(all_f1s) if all_f1s else 0.0
+            avg_p = np.mean(all_p) if all_p else 0.0
+            avg_r = np.mean(all_r) if all_r else 0.0
+            avg_f1 = np.mean(all_f1) if all_f1 else 0.0
+            return {'p': avg_p, 'r': avg_r, 'f1': avg_f1}
+
+        metrics_final = _calculate_prf1(list_final_preds, list_final_gts)
+        metrics_hop1 = _calculate_prf1(list_hop1_preds, list_hop1_gts)
+        metrics_hop2 = _calculate_prf1(list_hop2_preds, list_hop2_gts)
         
-        return avg_precision, avg_recall, avg_f1
+        return {
+            'final': metrics_final,
+            'hop1': metrics_hop1,
+            'hop2': metrics_hop2
+        }
 
     def train(self, train_data_loader, dev_data_loader, lr_scheduler=None):
         if self.optimizer is None: self.create_optimizers()
@@ -2528,6 +2610,7 @@ class Trainer(nn.Module):
             self.mode = 'train'; self.encoder.train(); self.gmodel.train()
             epoch_loss_train_list = []
             epoch_p1_train, epoch_r1_train, epoch_f1_1_train = [], [], [] # For 1-hop
+            epoch_p2_train, epoch_r2_train, epoch_f1_2_train = [], [], [] # For 2-hop
             epoch_p_final_train, epoch_r_final_train, epoch_f1_final_train = [], [], [] # For final preds
 
             accumulated_loss_for_step = torch.tensor(0.0, device=self.device)
@@ -2537,23 +2620,14 @@ class Trainer(nn.Module):
             for batch in train_pbar:
                 if batch is None: continue 
                 
-                batch_avg_loss, final_preds_str, hop1_preds_str = self.forward_per_batch(batch)
-                              
-
-                hop1_gt_batch = batch['hop1_target_cuis']
-                hop2_gt_batch = batch['hop2_target_cuis']
-               
-                combined_gt_batch = [
-                    list(set(hop1_gt_batch[i] + hop2_gt_batch[i]))
-                    for i in range(len(hop1_gt_batch))
-                ]
-
-                p1, r1, f1_1 = self.measure_accuracy(hop1_preds_str, batch['hop1_target_cuis'])
-                p_final, r_final, f1_final = self.measure_accuracy(final_preds_str, combined_gt_batch)
+                batch_avg_loss, batch_detailed_predictions = self.forward_per_batch(batch)
+                            
+                batch_metrics = self.measure_accuracy(batch_detailed_predictions, batch)
                 
                 # 記錄用於epoch平均的指標
-                epoch_p1_train.append(p1); epoch_r1_train.append(r1); epoch_f1_1_train.append(f1_1)
-                epoch_p_final_train.append(p_final); epoch_r_final_train.append(r_final); epoch_f1_final_train.append(f1_final)
+                epoch_p1_train.append(batch_metrics['hop1']['p']); epoch_r1_train.append(batch_metrics['hop1']['r']); epoch_f1_1_train.append(batch_metrics['hop1']['f1'])
+                epoch_p2_train.append(batch_metrics['hop2']['p']); epoch_r2_train.append(batch_metrics['hop2']['r']); epoch_f1_2_train.append(batch_metrics['hop2']['f1'])
+                epoch_p_final_train.append(batch_metrics['final']['p']); epoch_r_final_train.append(batch_metrics['final']['r']); epoch_f1_final_train.append(batch_metrics['final']['f1'])
 
                 if torch.isnan(batch_avg_loss) or torch.isinf(batch_avg_loss):
                     print(f"Warning: NaN/Inf loss @ Epoch {ep+1}, Batch {batch_idx_in_epoch+1}. Skipping."); self.optimizer.zero_grad(); accumulated_loss_for_step = torch.tensor(0.0, device=self.device); batch_idx_in_epoch +=1; continue
@@ -2570,13 +2644,16 @@ class Trainer(nn.Module):
                 if (batch_idx_in_epoch + 1) % update_step == 0:
                     torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0)
                     torch.nn.utils.clip_grad_norm_(self.gmodel.parameters(), 1.0)
-                    self.optimizer.step()
+                    self.optimizer.step(); 
+                    if self.scheduler and self.scheduler_type == 'warmup':
+                        self.scheduler.step()
                     self.optimizer.zero_grad()
                     train_pbar.set_postfix({'L': f'{accumulated_loss_for_step.item():.3f}', 
-                                            'F1@1': f'{f1_1:.3f}', 'F1@Final': f'{f1_final:.3f}'})
+                                            'F1@1': f'{batch_metrics["hop1"]["f1"]:.3f}','F1@2': f'{batch_metrics["hop2"]["f1"]:.3f}', 'F1@Final': f'{batch_metrics["final"]["f1"]:.3f}'})
                     accumulated_loss_for_step = torch.tensor(0.0, device=self.device)
                 batch_idx_in_epoch +=1
-
+                
+            # Process the last batch
             if batch_idx_in_epoch % update_step != 0 and accumulated_loss_for_step.item() > 0 :
                  torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0)
                  torch.nn.utils.clip_grad_norm_(self.gmodel.parameters(), 1.0)
@@ -2588,13 +2665,15 @@ class Trainer(nn.Module):
 
             avg_ep_train_loss = np.mean(epoch_loss_train_list) if epoch_loss_train_list else float('nan')
             avg_ep_f1_1_train = np.mean(epoch_f1_1_train) if epoch_f1_1_train else float('nan')
+            avg_ep_f1_2_train = np.mean(epoch_f1_2_train) if epoch_f1_2_train else float('nan')
             avg_ep_f1_final_train = np.mean(epoch_f1_final_train) if epoch_f1_final_train else float('nan')
-            print(f"\nEpoch {ep+1} Train Avg: Loss={avg_ep_train_loss:.4f}, F1@1={avg_ep_f1_1_train:.4f}, F1@Final={avg_ep_f1_final_train:.4f}")
+            print(f"\nEpoch {ep+1} Train Avg: Loss={avg_ep_train_loss:.4f}, F1@1={avg_ep_f1_1_train:.4f}, F1@2={avg_ep_f1_2_train:.4f}, F1@Final={avg_ep_f1_final_train:.4f}")
 
             avg_ep_dev_loss, avg_ep_p1_dev, avg_ep_r1_dev, avg_ep_f1_1_dev, \
+            avg_ep_p2_dev, avg_ep_r2_dev, avg_ep_f1_2_dev, \
             avg_ep_p_final_dev, avg_ep_r_final_dev, avg_ep_f1_final_dev = self.validate(dev_data_loader)
-            print(f"Epoch {ep+1} Valid Avg: Loss={avg_ep_dev_loss:.4f}, P@1={avg_ep_p1_dev:.4f}, R@1={avg_ep_r1_dev:.4f}, F1@1={avg_ep_f1_1_dev:.4f} | P@Final={avg_ep_p_final_dev:.4f}, R@Final={avg_ep_r_final_dev:.4f}, F1@Final={avg_ep_f1_final_dev:.4f}")
-
+            print(f"Epoch {ep+1} Valid Avg: Loss={avg_ep_dev_loss:.4f} \n P@1={avg_ep_p1_dev:.4f}, R@1={avg_ep_r1_dev:.4f}, F1@1={avg_ep_f1_1_dev:.4f} \n P@2={avg_ep_p2_dev:.4f}, R@2={avg_ep_r2_dev:.4f}, F1@2={avg_ep_f1_2_dev:.4f} \n P@Final={avg_ep_p_final_dev:.4f}, R@Final={avg_ep_r_final_dev:.4f}, F1@Final={avg_ep_f1_final_dev:.4f}")
+            
             if self.scheduler and self.scheduler_type == 'plateau':
                 # ReduceLROnPlateau 需要一個監控指標來決定是否降低學習率
                 metric_for_scheduler = avg_ep_dev_loss if self.early_stopping_metric == 'val_loss' else avg_ep_f1_final_dev
@@ -2640,11 +2719,10 @@ class Trainer(nn.Module):
         self.mode = 'eval'; self.encoder.eval(); self.gmodel.eval()
         epoch_loss_dev_list = []
         epoch_p1_dev, epoch_r1_dev, epoch_f1_1_dev = [], [], []
+        epoch_p2_dev, epoch_r2_dev, epoch_f1_2_dev = [], [], []
         epoch_p_final_dev, epoch_r_final_dev, epoch_f1_final_dev = [], [], []
         
         dev_pbar = tqdm(dev_data_loader, desc="Validation")
-        
-        hop1_num_list, final_num_list , hop1_target_num_list, final_target_num_list = [], [], [], []
         
         
         if self.analyze_pruning:
@@ -2654,42 +2732,27 @@ class Trainer(nn.Module):
         with torch.no_grad():
             for batch in dev_pbar:
                 if batch is None: continue
-                batch_avg_loss, final_preds_str, hop1_preds_str = self.forward_per_batch(batch)
+                batch_avg_loss, batch_detailed_predictions = self.forward_per_batch(batch)
                 
-                hop1_gt_batch = batch['hop1_target_cuis']
-                hop2_gt_batch = batch['hop2_target_cuis']
-                combined_gt_batch = [
-                    list(set(hop1_gt_batch[i] + hop2_gt_batch[i]))
-                    for i in range(len(hop1_gt_batch))
-                ]
-                
-                for i in range(len(hop1_gt_batch)):
-                    hop1_num_list.append(len(hop1_preds_str[i]))
-                    final_num_list.append(len(final_preds_str[i]))
-                    hop1_target_num_list.append(len(hop1_gt_batch[i]))
-                    final_target_num_list.append(len(combined_gt_batch[i]))
-
-                p1, r1, f1_1 = self.measure_accuracy(hop1_preds_str, batch['hop1_target_cuis'])
-                p_final, r_final, f1_final = self.measure_accuracy(final_preds_str, combined_gt_batch)
+                batch_metrics = self.measure_accuracy(batch_detailed_predictions, batch)
 
                 epoch_loss_dev_list.append(batch_avg_loss.item())
-                epoch_p1_dev.append(p1); epoch_r1_dev.append(r1); epoch_f1_1_dev.append(f1_1)
-                epoch_p_final_dev.append(p_final); epoch_r_final_dev.append(r_final); epoch_f1_final_dev.append(f1_final)
-                dev_pbar.set_postfix({'L': f'{batch_avg_loss.item():.3f}', 'F1@1': f'{f1_1:.3f}', 'F1@Final': f'{f1_final:.3f}'})
+                epoch_p1_dev.append(batch_metrics['hop1']['p']); epoch_r1_dev.append(batch_metrics['hop1']['r']); epoch_f1_1_dev.append(batch_metrics['hop1']['f1'])
+                epoch_p2_dev.append(batch_metrics['hop2']['p']); epoch_r2_dev.append(batch_metrics['hop2']['r']); epoch_f1_2_dev.append(batch_metrics['hop2']['f1'])
+                epoch_p_final_dev.append(batch_metrics['final']['p']); epoch_r_final_dev.append(batch_metrics['final']['r']); epoch_f1_final_dev.append(batch_metrics['final']['f1'])
+                dev_pbar.set_postfix({'L': f'{batch_avg_loss.item():.3f}', 'F1@1': f'{batch_metrics["hop1"]["f1"]:.3f}','F1@2': f'{batch_metrics["hop2"]["f1"]:.3f}', 'F1@Final': f'{batch_metrics["final"]["f1"]:.3f}'})
 
         avg_loss = np.mean(epoch_loss_dev_list) if epoch_loss_dev_list else float('nan')
         avg_p1 = np.mean(epoch_p1_dev) if epoch_p1_dev else 0.0
         avg_r1 = np.mean(epoch_r1_dev) if epoch_r1_dev else 0.0
         avg_f1_1 = np.mean(epoch_f1_1_dev) if epoch_f1_1_dev else 0.0
+        avg_p2 = np.mean(epoch_p2_dev) if epoch_p2_dev else 0.0
+        avg_r2 = np.mean(epoch_r2_dev) if epoch_r2_dev else 0.0
+        avg_f1_2 = np.mean(epoch_f1_2_dev) if epoch_f1_2_dev else 0.0
         avg_p_final = np.mean(epoch_p_final_dev) if epoch_p_final_dev else 0.0
         avg_r_final = np.mean(epoch_r_final_dev) if epoch_r_final_dev else 0.0
         avg_f1_final = np.mean(epoch_f1_final_dev) if epoch_f1_final_dev else 0.0
         
-        hop1_avg_num = np.mean(hop1_num_list) if hop1_num_list else 0.0
-        final_avg_num = np.mean(final_num_list) if final_num_list else 0.0
-        hop1_target_avg_num = np.mean(hop1_target_num_list) if hop1_target_num_list else 0.0
-        final_target_avg_num = np.mean(final_target_num_list) if final_target_num_list else 0.0
-        print(f"hop1_avg_num: {hop1_avg_num}, final_avg_num: {final_avg_num}, hop1_target_avg_num: {hop1_target_avg_num}, final_target_avg_num: {final_target_avg_num}")
         
         if self.analyze_pruning:
             print("\n--- Path Pruning Analysis Results ---")
@@ -2705,7 +2768,7 @@ class Trainer(nn.Module):
             print("-------------------------------------\n")       
        
 
-        return avg_loss, avg_p1, avg_r1, avg_f1_1, avg_p_final, avg_r_final, avg_f1_final
+        return avg_loss, avg_p1, avg_r1, avg_f1_1,avg_p2, avg_r2, avg_f1_2, avg_p_final, avg_r_final, avg_f1_final
 
 # ====================== Main Block ======================
 if __name__ =='__main__':
@@ -2719,7 +2782,7 @@ if __name__ =='__main__':
     GRAPH_NX_FILE = "./drknows/SNOMED_CUI_MAJID_Graph_wSelf.pkl" # 原始 NetworkX 圖
     
     CUI_EMBEDDING_FILE = "./drknows/GraphModel_SNOMED_CUI_Embedding.pkl"
-    
+    RELATION_EMBEDDING_FILE = "./drknows/relation_sapbert_embeddings.pkl"
     # TRAIN_ANNOTATION_FILE = "./MediQ/mediq_train_preprocessed.jsonl"
     # DEV_ANNOTATION_FILE = './MediQ/mediq_dev_preprocessed.jsonl'
     TRAIN_ANNOTATION_FILE = "./MediQ/mediq_train_annotations_bm25_20.json"
@@ -2740,11 +2803,13 @@ if __name__ =='__main__':
         exit()
         
     try:
-        # 將 device 傳遞給 CuiEmbedding 的構造函數
         cui_embedding_lookup_obj = CuiEmbedding(CUI_EMBEDDING_FILE, device=device)
         print(" CuiEmbedding 實例化成功。")
     except Exception as e:
         print(f"實例化 CuiEmbedding 時出錯: {e}"); exit()
+        
+        
+
     
 
     
@@ -2784,7 +2849,8 @@ if __name__ =='__main__':
         tokenizer=tokenizer,
         encoder=base_encoder_model,
         g_nx=g_nx_loaded,
-        cui_embedding_lookup=cui_embedding_lookup_obj, 
+        cui_embedding_lookup=cui_embedding_lookup_obj,
+        relation_embedding_filepath=RELATION_EMBEDDING_FILE, 
         hdim=hdim,
         nums_of_head=nums_of_head,
         cui_vocab_str_to_idx=cui_vocab_for_trainer,
@@ -2793,24 +2859,30 @@ if __name__ =='__main__':
         nums_of_epochs=epochs, 
         LR=LR,
         loss_type="FOCAL",
-        focal_alpha=0.9,
-        focal_gamma=3.0,
+        focal_alpha=0.95,
+        focal_gamma=2.0,
         cui_weights_dict=None, 
         contrastive_learning=contrastive_flag,
         intermediate=intermediate_loss_flag,
-        score_threshold=0.7,
+        score_threshold=0.5,
+        finetune_encoder=False,        
+        use_soft_labels=False,         
+        soft_label_threshold=0.8,     
+        preserve_gt_in_pruning=True,         
         save_model_path=model_save_path,
         gnn_update=True, 
         path_encoder_type="Transformer",
         path_ranker_type="Flat",
-        gnn_type="STACK", 
+        gnn_type="GAT", 
         gin_hidden_dim=gin_hidden_dim_val,
         gin_num_layers=gin_num_layers_val,
-        early_stopping_patience=5,
+        early_stopping_patience=3,
         early_stopping_metric='val_loss',
-        early_stopping_delta=0.001,
+        early_stopping_delta=0.0001,
         lambda_triplet=0.01,
-        analyze_pruning=False
+        analyze_pruning=False,
+        scheduler_type="warmup",
+        warmup_steps=2000
     )
     print("Trainer instantiated.")
 
