@@ -193,7 +193,7 @@ class MediQAnnotatedDataset(Dataset):
                                 hop2_target_cuis_set.add(target_cui_in_path)
         
         # (此處的返回邏輯保持不變)
-        if not hop1_target_cuis_set and not hop2_target_cuis_set:
+        if not hop1_target_cuis_set or not hop2_target_cuis_set:
             return None
 
         return {
@@ -2355,30 +2355,56 @@ class Trainer(nn.Module):
                             elif running_k == 1:
                                 self.pruning_stats['total_gt_candidates_hop2'] += num_gt_candidates
                                 self.pruning_stats['gt_dropped_hop2'] += num_gt_dropped
+                                
+                self.lambda_hop1 = 1.0
+                self.lambda_intermediate = 0.7
+                self.lambda_hop2 = 0.7
+                         
+                if running_k == 0:  # 處理第一跳 (Hop 1) 的損失
                 
+                    # 1. 分離 GT
+                    gt_hop1 = list(set(hop1_target_cuis_str_batch[i]))
+                    gt_intermediate = list(set(intermediate_target_cuis_batch[i]))
+                    
+                    # 2. 獨立計算各自的 BCE 損失
+                    loss_bce_hop1 = torch.tensor(0.0, device=self.device)
+                    if gt_hop1 and all_paths_info_hop:
+                        loss_bce_hop1 = self.compute_bce_loss_for_hop(all_paths_info_hop, gt_hop1)
+                    
+                    loss_bce_intermediate = torch.tensor(0.0, device=self.device)
+                    if self.intermediate and gt_intermediate and all_paths_info_hop:
+                        loss_bce_intermediate = self.compute_bce_loss_for_hop(all_paths_info_hop, gt_intermediate)
+                    
+                    # 3. 根據權重組合 BCE 損失
+                    #    (lambda_intermediate 來自我們之前在 __init__ 中定義的超參數)
+                    combined_bce_loss = loss_bce_hop1 + self.lambda_intermediate * loss_bce_intermediate
+                    
+                    # 4. 計算 Triplet Loss (如果啟用)
+                    triplet_loss = torch.tensor(0.0, device=self.device)
+                    combined_gt_for_triplet = list(set(gt_hop1 + gt_intermediate))
+                    if self.contrastive_learning and self.mode == 'train' and combined_gt_for_triplet and all_paths_info_hop:
+                        triplet_loss = self.compute_triplet_loss_for_hop(task_emb_sample, all_paths_info_hop, combined_gt_for_triplet)
+                    
+                    # 5. 計算最終加權後的 Hop 1 總損失
+                    total_hop_loss = combined_bce_loss + self.lambda_triplet * triplet_loss
+                    final_weighted_loss = self.lambda_hop1 * total_hop_loss
+                
+                elif running_k == 1: # 處理第二跳 (Hop 2) 的損失
+                    gt_hop2 = list(set(hop2_target_cuis_str_batch[i]))
+                    
+                    loss_bce_hop2 = torch.tensor(0.0, device=self.device)
+                    if gt_hop2 and all_paths_info_hop:
+                        loss_bce_hop2 = self.compute_bce_loss_for_hop(all_paths_info_hop, gt_hop2)
+                    
+                    triplet_loss_hop2 = torch.tensor(0.0, device=self.device)
+                    if self.contrastive_learning and self.mode == 'train' and gt_hop2 and all_paths_info_hop:
+                        triplet_loss_hop2 = self.compute_triplet_loss_for_hop(task_emb_sample, all_paths_info_hop, gt_hop2)
+                        
+                    total_hop_loss = loss_bce_hop2 + self.lambda_triplet * triplet_loss_hop2
+                    final_weighted_loss = self.lambda_hop2 * total_hop_loss
 
-                current_hop_bce_loss = torch.tensor(0.0, device=self.device)
-                current_hop_triplet_loss = torch.tensor(0.0, device=self.device)
-                if gt_cuis_str_list_this_hop and all_paths_info_hop.get('scores') is not None and all_paths_info_hop['scores'].numel() > 0:
-                    current_hop_bce_loss = self.compute_bce_loss_for_hop(all_paths_info_hop, gt_cuis_str_list_this_hop)
-                    if self.contrastive_learning and self.mode == "train" and \
-                       all_paths_info_hop.get('encoded_embeddings') is not None and all_paths_info_hop['encoded_embeddings'].numel() > 0:
-                        anchor_for_triplet = task_emb_sample
-                        current_hop_triplet_loss = self.compute_triplet_loss_for_hop(
-                            anchor_for_triplet, all_paths_info_hop, gt_cuis_str_list_this_hop
-                        )
-                current_hop_total_loss = current_hop_bce_loss + self.lambda_triplet * current_hop_triplet_loss
-                
-                len_penalty = True
-                if len_penalty:
-                    if running_k == 0: # running_k=0 代表是第一跳 (1-hop)
-                        hop_weighted_loss = 1.0 * current_hop_total_loss
-                    elif running_k == 1: # running_k=1 代表是第二跳 (2-hop)
-                        hop_weighted_loss = 0.7 * current_hop_total_loss
-                else:
-                    hop_weighted_loss = current_hop_total_loss
-                
-                sample_loss_this_item = sample_loss_this_item + hop_weighted_loss
+                # 將計算好的、加權後的損失累加
+                sample_loss_this_item += final_weighted_loss
                 
                 # --- ## MODIFIED: 基於閾值篩選高質量預測，並執行路徑取代 ---
                 path_scores = all_paths_info_hop['scores'].squeeze(-1) # [num_paths]
@@ -2827,7 +2853,7 @@ if __name__ =='__main__':
     top_n = 8 
     epochs = 100 
     LR = 1e-5
-    intermediate_loss_flag = True 
+    intermediate_loss_flag = True
     contrastive_flag = False
     batch_size = 2 
     

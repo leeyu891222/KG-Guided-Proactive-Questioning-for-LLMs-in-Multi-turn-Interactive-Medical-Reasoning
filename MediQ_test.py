@@ -315,6 +315,7 @@ def main(args):
         encoder=base_encoder_model,
         g_nx=g_nx_loaded,
         cui_embedding_lookup=cui_embedding_lookup_obj,
+        relation_embedding_filepath='drknows/relation_sapbert_embeddings.pkl',
         hdim=base_encoder_model.config.hidden_size,
         nums_of_head=3,
         cui_vocab_str_to_idx=cui_vocab_for_trainer,
@@ -389,8 +390,8 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="為 MediQ 任務評估訓練好的圖譜推理模型")
     parser.add_argument("--test_data_dir", type=str, default='./Evaluate', help="包含多個預處理後 .jsonl 測試集的資料夾路徑。")
-    parser.add_argument("--gmodel_path", type=str, default='/home/yhchang/Desktop/yuchen/thesis/saved_models_mediq/0612_67f1_complete_noCL_nodiff/gmodel_mediq_best.pth', help="已訓練好的 GraphModel 權重檔案 (.pth) 路徑。")
-    parser.add_argument("--encoder_path", type=str, default='/home/yhchang/Desktop/yuchen/thesis/saved_models_mediq/0612_67f1_complete_noCL_nodiff/encoder.pth', help="已訓練好的 Encoder (SapBERT) 權重檔案 (.pth) 路徑。")
+    parser.add_argument("--gmodel_path", type=str, default='saved_models_mediq/0622_complete_RGAT_noCL_nodiff_intloss/gmodel_mediq_best.pth', help="已訓練好的 GraphModel 權重檔案 (.pth) 路徑。")
+    parser.add_argument("--encoder_path", type=str, default='saved_models_mediq/0622_complete_RGAT_noCL_nodiff_intloss/encoder.pth', help="已訓練好的 Encoder (SapBERT) 權重檔案 (.pth) 路徑。")
     parser.add_argument("--output_dir", type=str, default='./Evaluate', help="儲存評估報告的資料夾路徑。")
     parser.add_argument("--cui_vocab_path", type=str, default='./drknows/sm_t047_cui_aui_eng.pkl', help="CUI 到文本映射的 pickle 檔案路徑。")
     parser.add_argument("--graph_path", type=str, default='./drknows/SNOMED_CUI_MAJID_Graph_wSelf.pkl', help="用於模型初始化的 NetworkX 圖譜 pickle 檔案路徑。")
