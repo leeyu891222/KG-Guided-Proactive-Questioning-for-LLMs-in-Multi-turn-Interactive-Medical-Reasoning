@@ -117,6 +117,7 @@ class MediQAnnotatedDataset(Dataset):
         if index >= len(self.valid_training_samples):
             raise IndexError("Index out of bounds for valid_training_samples")
             
+        # --- 步驟 1: 原始的事實採樣 (邏輯不變) ---
         sample_info = self.valid_training_samples[index]
         case_id = sample_info["case_id"]
         guaranteed_known_idx = sample_info["guaranteed_known_idx"]
@@ -133,13 +134,92 @@ class MediQAnnotatedDataset(Dataset):
 
         remaining_indices = list(set(range(num_facts)) - known_indices - unknown_indices)
         self.random.shuffle(remaining_indices)
-
+        
         if remaining_indices:
             num_additional_known = self.random.randint(0, len(remaining_indices))
             known_indices.update(remaining_indices[:num_additional_known])
             unknown_indices.update(remaining_indices[num_additional_known:])
+        
+        known_indices = sorted(list(known_indices))
+        unknown_indices = sorted(list(unknown_indices))
 
-        known_texts_list = [atomic_facts[i] for i in sorted(list(known_indices))]
+        # --- 【修改點 A】: 提前準備和增強輸入資訊 ---
+
+        # 1. 先從採樣出的「已知事實」準備基礎輸入
+        known_texts_list = [atomic_facts[i] for i in known_indices]
+        known_cuis_list_flat = [cui for i in known_indices for cui in facts_cuis[i]]
+
+        # 2. 立即檢查並增強 QA 資訊（如果存在）
+        has_qa_data = 'question_cui' in data and data['question_cui']
+        if has_qa_data:
+            question_text = data.get('question', '')
+            question_cuis = data.get('question_cui', [])
+            
+            # 將問題文本和CUI加入到「已知」集合中
+            known_texts_list.insert(0, question_text)
+            known_cuis_list_flat.extend(question_cuis)
+        
+        # 3. 創建最終的、完整的「已知CUI過濾集合」
+        known_cuis_list_unique = list(set(known_cuis_list_flat))
+        known_cuis_set_for_filtering = set(known_cuis_list_unique)
+
+        # --- 步驟 2: 構建目標標籤 (Ground Truth)，並使用完整的過濾集合 ---
+        hop1_target_cuis_set = set()
+        hop2_target_cuis_set = set()
+        intermediate_target_cuis_set = set()
+
+        def parse_and_add_path_targets(path_data):
+            
+            if not path_data or not isinstance(path_data, list) or len(path_data) < 3:
+                return
+            
+            path_len = len(path_data)
+            target_cui = path_data[-1]
+
+            # 關鍵過濾：確保目標不在完整的已知CUI集合中
+            if not (isinstance(target_cui, str) and target_cui.startswith('C')) or target_cui in known_cuis_set_for_filtering:
+                return
+            
+            if path_len == 3:
+                hop1_target_cuis_set.add(target_cui)
+            elif path_len == 5:
+                intermediate_cui = path_data[2]
+                if isinstance(intermediate_cui, str) and intermediate_cui.startswith('C') and intermediate_cui not in known_cuis_set_for_filtering:
+                    intermediate_target_cuis_set.add(intermediate_cui)
+                hop2_target_cuis_set.add(target_cui)
+        
+        # 2a. 處理 fact -> unknown_fact 的路徑
+        for k_idx in known_indices:
+            for u_idx in unknown_indices:
+                path_key = f"{k_idx}_{u_idx}"
+                if path_key in paths_between_facts:
+                    for path in paths_between_facts[path_key]:
+                        parse_and_add_path_targets(path)
+
+        # 2b. 如果有 QA 資訊，處理 QA 相關的路徑
+        if has_qa_data:
+            qa_paths = data.get('paths_between_QA_facts', {})
+            answer_cuis = data.get('answer_cui', [])
+
+            # 處理 Q -> unknown_fact 的路徑
+            for u_idx in unknown_indices:
+                path_key = f"Q_{u_idx}"
+                if path_key in qa_paths:
+                    for path in qa_paths[path_key]:
+                        parse_and_add_path_targets(path)
+            
+            # 處理 known_fact -> A 的路徑
+            if answer_cuis:
+                for k_idx in known_indices:
+                    path_key = f"{k_idx}_A"
+                    if path_key in qa_paths:
+                        for path in qa_paths[path_key]:
+                            # 這裡的目標必須是答案CUI之一，並且也不能是已知的
+                            if path and path[-1] in answer_cuis:
+                                parse_and_add_path_targets(path)
+                
+
+        # --- 步驟 4: 最終處理與返回 ---
         known_texts_combined = " ".join(known_texts_list) if known_texts_list else "N/A"
         
         input_text_tks = self.tokenizer(known_texts_combined,
@@ -147,59 +227,17 @@ class MediQAnnotatedDataset(Dataset):
                                         max_length=512, return_tensors="pt")
         input_text_tks = {k: v.squeeze(0) for k, v in input_text_tks.items()}
 
-        known_cuis_list_flat = []
-        for i in known_indices:
-            current_fact_cuis = facts_cuis[i]
-            if isinstance(current_fact_cuis, list):
-                known_cuis_list_flat.extend(current_fact_cuis)
+        # 確保 known_cuis 是唯一的
         known_cuis_list_unique = list(set(known_cuis_list_flat))
         
-        # --- 【修改點 1】將已知CUI列表轉換為集合，以提高查詢效率 ---
-        known_cuis_set_for_filtering = set(known_cuis_list_unique)
-
-        hop1_target_cuis_set = set()
-        hop2_target_cuis_set = set()
-        intermediate_target_cuis_set = set()
-        
-        for k_idx in known_indices:
-            for u_idx in unknown_indices:
-                path_key_optional = f"{k_idx}_{u_idx}"
-                if path_key_optional in paths_between_facts:
-                    for path_data in paths_between_facts[path_key_optional]:
-                        if not path_data or not isinstance(path_data, list) or len(path_data) < 1: continue
-                        
-                        path_len = len(path_data)
-                        target_cui_in_path = path_data[-1]
-                        is_valid_cui_str = isinstance(target_cui_in_path, str) and target_cui_in_path.startswith('C')
-                        
-                        if is_valid_cui_str and isinstance(facts_cuis[u_idx], list) and \
-                           target_cui_in_path in facts_cuis[u_idx]:
-                            
-                            # --- 【修改點 2】在添加GT之前，檢查最終目標CUI是否已經是已知的 ---
-                            if target_cui_in_path in known_cuis_set_for_filtering:
-                                # 如果最終目標CUI已經在已知集合中，則這不是一條有效的探索路徑GT，跳過。
-                                continue
-                            # --- 修改結束 ---
-
-                            if path_len == 3: # 1-hop path
-                                hop1_target_cuis_set.add(target_cui_in_path)
-                            elif path_len == 5: # 2-hop path
-                                intermediate_cui = path_data[2]
-                                if isinstance(intermediate_cui, str) and intermediate_cui.startswith('C'):
-                                    # 根據您的要求，中間節點可以是已知的，所以這裡不過濾。
-                                    intermediate_target_cuis_set.add(intermediate_cui)
-                                
-                                # 2跳路徑的最終目標已經在上面被過濾過了。
-                                hop2_target_cuis_set.add(target_cui_in_path)
-        
-        # (此處的返回邏輯保持不變)
-        if not hop1_target_cuis_set or not hop2_target_cuis_set:
+        # 檢查是否有任何 GT，如果沒有則返回 None 以便 collate_fn 過濾
+        if not hop1_target_cuis_set and not hop2_target_cuis_set:
             return None
 
         return {
             "case_id": case_id,
-            "known_indices": sorted(list(known_indices)),
-            "unknown_indices": sorted(list(unknown_indices)),
+            #"known_indices": known_indices,
+            #"unknown_indices": unknown_indices,
             "input_text_tks": input_text_tks,
             "known_cuis": known_cuis_list_unique,
             "hop1_target_cuis": list(hop1_target_cuis_set),
@@ -1266,7 +1304,7 @@ class GraphModel(nn.Module):
             self.p_ranker = TriAttnFlatPathRanker(hdim)
 
         self.k_hops = num_hops
-        self.path_per_batch_size = 64
+        self.path_per_batch_size = 256
         self.top_n = top_n
         self.cui_weights_dict = cui_weights_dict if cui_weights_dict else {}
         self.hdim = hdim # Store hdim for use
@@ -1503,10 +1541,10 @@ class GraphModel(nn.Module):
                     # 如果輸入維度不匹配，跳過GNN更新以防出錯
                     print(f"警告 (GIN): 在 hop {running_k_hop}，輸入維度不匹配，將跳過GNN更新。")
             
-        pruning_threshold_count = 64 # 您設定的篩選路徑數量上限
+        pruning_threshold_count = 256 # 您設定的篩選路徑數量上限
         num_paths_this_hop_before_pruning = num_paths_this_hop # ## NOW THIS IS VALID ##
 
-        if num_paths_this_hop > pruning_threshold_count: # Check against initial num_paths_this_hop
+        if num_paths_this_hop > pruning_threshold_count and gt_indices_for_pruning is not None: # Check against initial num_paths_this_hop
             # print(f"  Hop {running_k_hop}: Path count {num_paths_this_hop} exceeds threshold {pruning_threshold_count}. Applying pruning.")
 
             if unique_tgt_embs.numel() > 0 : # 確保 unique_tgt_embs 不是空的
@@ -2811,8 +2849,9 @@ if __name__ =='__main__':
     RELATION_EMBEDDING_FILE = "./drknows/relation_sapbert_embeddings.pkl"
     # TRAIN_ANNOTATION_FILE = "./MediQ/mediq_train_preprocessed.jsonl"
     # DEV_ANNOTATION_FILE = './MediQ/mediq_dev_preprocessed.jsonl'
-    TRAIN_ANNOTATION_FILE = "./MediQ/mediq_train_annotations_bm25_20.json"
-    DEV_ANNOTATION_FILE = './MediQ/mediq_dev_annotations_bm25_20.json'
+    TRAIN_ANNOTATION_FILE = "./MediQ/mediq_train_annotations_wQA.json"
+    DEV_ANNOTATION_FILE = './MediQ/mediq_dev_annotations_wQA.json'
+    TEST_ANNOTATION_FILE = './MediQ/mediq_test_annotations_wQA.json'
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -2890,16 +2929,16 @@ if __name__ =='__main__':
         cui_weights_dict=None, 
         contrastive_learning=contrastive_flag,
         intermediate=intermediate_loss_flag,
-        score_threshold=0.5,
+        score_threshold=0.7,
         finetune_encoder=False,        
         use_soft_labels=False,         
-        soft_label_threshold=0.8,     
+        soft_label_threshold=0.9,     
         preserve_gt_in_pruning=True,         
         save_model_path=model_save_path,
         gnn_update=True, 
         path_encoder_type="Transformer",
         path_ranker_type="Flat",
-        gnn_type="GAT", 
+        gnn_type="STACK", 
         gin_hidden_dim=gin_hidden_dim_val,
         gin_num_layers=gin_num_layers_val,
         early_stopping_patience=3,
@@ -2922,6 +2961,14 @@ if __name__ =='__main__':
         # dev_dataset_obj = MediQPreprocessedDataset(DEV_ANNOTATION_FILE)
         train_dataset_obj = MediQAnnotatedDataset(TRAIN_ANNOTATION_FILE, tokenizer)
         dev_dataset_obj = MediQAnnotatedDataset(DEV_ANNOTATION_FILE, tokenizer)
+        test_dataset_obj = MediQAnnotatedDataset(TEST_ANNOTATION_FILE, tokenizer)
+        
+        print(f"Original dataset sizes: Train={len(train_dataset_obj)}, Dev={len(dev_dataset_obj)}, Test={len(test_dataset_obj)}")
+
+        
+        combined_train_dev_dataset = torch.utils.data.ConcatDataset([train_dataset_obj, dev_dataset_obj])
+        print(f"Combined training dataset size: {len(combined_train_dev_dataset)}")
+
     except Exception as e:
         print(f"Error loading datasets: {e}"); exit()
         
@@ -2932,8 +2979,8 @@ if __name__ =='__main__':
 
     # train_loader_instance = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_mediq_preprocessed, num_workers=6, pin_memory=True)
     # dev_loader_instance = DataLoader(dev_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_preprocessed, num_workers=6, pin_memory=True)
-    train_loader_instance = DataLoader(train_dataset_obj, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_mediq_paths, num_workers=6, pin_memory=True)
-    dev_loader_instance = DataLoader(dev_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths, num_workers=6, pin_memory=True)
+    train_loader_instance = DataLoader(combined_train_dev_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_mediq_paths, num_workers=6, pin_memory=True)
+    dev_loader_instance = DataLoader(test_dataset_obj, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_mediq_paths, num_workers=6, pin_memory=True)
     print("Dataloaders created.")
 
     print("\n" + "="*30 + "\n STARTING Tensorized Trainer RUN  \n" + "="*30 + "\n")
